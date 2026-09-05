@@ -1,0 +1,65 @@
+[package]
+name = "mlab-cloudflare"
+version = "0.1.0"
+edition = "2021"
+description = "CLI over the Cloudflare API, built as a base for read-only account and zone audit"
+license = "MIT"
+repository = "https://github.com/mlab-sh/mlab-cloudflare"
+homepage = "https://github.com/mlab-sh/mlab-cloudflare"
+readme = "README.md"
+keywords = ["cloudflare", "audit", "security", "cli", "dns"]
+categories = ["command-line-utilities", "web-programming"]
+
+# Debian packaging. The .deb ships on the GitHub release, nowhere else. The
+# release profile already strips the binary, so CI passes --no-strip: letting
+# cargo-deb strip it again would run the host strip against the aarch64 binary
+# and fail the cross build.
+[package.metadata.deb]
+maintainer = "mlab <hello@mlab.sh>"
+section = "net"
+priority = "optional"
+extended-description = """\
+mlab-cloudflare reads a Cloudflare account over the v4 API with a read-only API \
+token and turns what it finds into graded security checks: who holds which \
+credential, what the DNS zones expose, how the edge is configured, and what \
+changed since the last snapshot. It only reads, and nothing leaves the machine \
+unless a command says it does."""
+depends = "$auto"
+assets = [
+    ["target/release/mlab-cloudflare", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/mlab-cloudflare/README.md", "644"],
+    ["LICENSE", "usr/share/doc/mlab-cloudflare/copyright", "644"],
+]
+
+# RPM packaging, for dnf/yum. Unlike cargo-deb, the source paths here are taken
+# literally, so CI stages the cross-built binary at pkg/mlab-cloudflare first
+# rather than relying on a target rewrite that would silently package the wrong
+# architecture. auto-req is off for the same reason.
+[package.metadata.generate-rpm]
+summary = "CLI over the Cloudflare API, for read-only account audit"
+license = "MIT"
+auto-req = "disabled"
+assets = [
+    { source = "pkg/mlab-cloudflare", dest = "/usr/bin/mlab-cloudflare", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/mlab-cloudflare/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/mlab-cloudflare/LICENSE", mode = "644", doc = true },
+]
+
+[[bin]]
+name = "mlab-cloudflare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+colored = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+
+[profile.release]
+strip = true
+opt-level = "z"
+lto = true
