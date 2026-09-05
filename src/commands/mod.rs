@@ -5,7 +5,9 @@
 //! its own arguments for the ones that only touch the config file.
 
 pub mod accounts;
+pub mod activity;
 pub mod api;
+pub mod identity;
 pub mod login;
 pub mod ping;
 pub mod profile;

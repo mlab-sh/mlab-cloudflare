@@ -6,10 +6,12 @@
 //! | module     | role                                                        |
 //! | ---------- | ----------------------------------------------------------- |
 //! | `cf`       | the API: HTTP handler, profiles, account and zone resolution |
+//! | `audit`    | the graded checks, as pure functions over fetched data       |
 //! | `ui`       | everything the user sees: progress on stderr, rendering      |
 //! | `cli`      | the clap surface and the dispatch                            |
 //! | `commands` | one module per command                                       |
 
+mod audit;
 mod cf;
 mod cli;
 mod commands;

@@ -21,6 +21,8 @@ unless a command says it does and you pass the flag that allows it.
 | [`ping`](Ping) | Check that the current profile reaches the API. |
 | [`accounts`](Accounts) | Accounts this credential reaches. |
 | [`zones`](Zones) | Zones of the account being scanned, and which of them enforce nothing. |
+| [`identity`](Identity) | Who can change this account, and with what. Graded. |
+| [`activity`](Activity) | What was actually done to this account, and by whom. |
 | [`api`](Api) | Raw request against any endpoint, for everything not wrapped yet. |
 | [`profile`](Configuration) | List, show, select and delete saved profiles. |
 | [`config`](Configuration) | Where the config file is, and what is in it. |

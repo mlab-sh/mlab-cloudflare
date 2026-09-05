@@ -5,7 +5,7 @@ Strip the Radar endpoints, which describe the internet rather than your
 account, and roughly **1,230** of them read some part of a configuration you
 own.
 
-The full analysis — 77 concrete checks across eight planes, each with the
+The full analysis — 78 concrete checks across eight planes, each with the
 endpoint, what it exposes and the finding it produces — lives in a separate
 document:
 
@@ -59,6 +59,12 @@ looking reads as though it looked everywhere:
 - Configuration history exists only as far back as the audit log's retention.
 - Anything below the plan line answers the same way as a missing permission.
   See [Errors](Errors).
+
+## The phases
+
+The same document ends with the full build plan — eleven phases, what each one
+reads, what it produces and what it finds — of which two are done. [Roadmap](Roadmap)
+is the short version kept next to the code.
 
 ## See also
 

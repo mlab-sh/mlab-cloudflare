@@ -61,6 +61,8 @@ which is where wrangler and the Terraform provider already put them.
 | `ping` | Check that the current profile reaches the API. |
 | `accounts` | Accounts this credential reaches. |
 | `zones` | Zones of the account being scanned, and which of them enforce nothing. |
+| `identity` | Who can change this account, and with what. Graded findings. |
+| `activity` | What was actually done to this account, and by whom. |
 | `api` | Raw request against any endpoint, for everything not wrapped yet. |
 | `profile` | List, show, select and delete saved profiles. |
 | `config` | Where the config file is, and what is in it. |
@@ -112,6 +114,7 @@ src/
   cli/           the clap surface, and the context a command runs in
   commands/      one file per command
   cf/            the HTTP client, profiles, scope resolution, redaction
+  audit.rs       the graded checks, as pure functions over fetched data
   ui/            the terminal render and the progress rules
 ```
 

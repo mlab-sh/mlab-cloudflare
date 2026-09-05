@@ -102,8 +102,19 @@ pub enum Cmd {
     /// Accounts this credential reaches
     Accounts(ListArgs),
 
-    /// Zones this credential reaches
+    /// Zones of the account being scanned
     Zones(commands::zones::ZonesArgs),
+
+    /// Who can change this account, and with what
+    #[command(alias = "iam")]
+    Identity {
+        #[command(subcommand)]
+        cmd: Option<commands::identity::IdentityCmd>,
+    },
+
+    /// What was actually done to this account, and by whom
+    #[command(alias = "audit-log", alias = "log")]
+    Activity(commands::activity::ActivityArgs),
 
     /// Raw request against the API base, for anything not wrapped yet
     #[command(
@@ -159,6 +170,8 @@ pub async fn run() -> Result<()> {
         Cmd::Whoami => commands::whoami::run(&c, &ctx).await,
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
+        Cmd::Identity { cmd } => commands::identity::run(&c, &ctx, cmd).await,
+        Cmd::Activity(a) => commands::activity::run(&c, &ctx, &a).await,
         Cmd::Api(a) => commands::api::run(&c, &ctx, a).await,
     }
 }

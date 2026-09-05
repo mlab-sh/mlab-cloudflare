@@ -86,7 +86,125 @@ pub const POLICY_COLS: &[Col] = &[
     Col("PERMISSIONS", &["permissions"]),
 ];
 
+/// What an audit could not look at, so a report never implies it did.
+pub const UNREAD_COLS: &[Col] = &[
+    Col("AREA", &["area"]),
+    Col("ENDPOINT", &["path"]),
+    Col("WHY", &["reason"]),
+];
+
+pub const MEMBER_COLS: &[Col] = &[
+    Col("EMAIL", &["email"]),
+    Col("STATUS", &["status"]),
+    Col("2FA", &["twoFactor"]),
+    Col("ROLES", &["roles"]),
+    Col("ID", &["id"]),
+];
+
+/// API tokens, read as credentials: what is missing — an expiry, a last-used
+/// date — matters as much as what is set.
+pub const TOKEN_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("STATUS", &["status"]),
+    Col("ACCESS", &["access"]),
+    Col("EXPIRES", &["expires"]),
+    Col("LAST USED", &["lastUsed"]),
+    Col("POLICIES", &["policies"]),
+    Col("ID", &["id"]),
+];
+
+pub const SCIM_COLS: &[Col] = &[
+    Col("USER", &["user"]),
+    Col("ACTIVE", &["active"]),
+    Col("ID", &["id"]),
+];
+
+pub const ACTIVITY_COLS: &[Col] = &[
+    Col("WHEN", &["when"]),
+    Col("ACTOR", &["actor"]),
+    Col("BY", &["by"]),
+    Col("ACTION", &["action"]),
+    Col("RESULT", &["result"]),
+    Col("RESOURCE", &["resource"]),
+    Col("IP", &["ip"]),
+];
+
 // ---- blocks -----------------------------------------------------------------
+
+/// Graded findings, worst first.
+///
+/// Not a table: the detail of a finding is the list of names somebody has to
+/// act on, and a column would clip it at the width of the terminal. So each
+/// finding is a severity tag, a sentence, and its names wrapped underneath.
+pub fn findings(rows: &[Value]) {
+    if is_json() {
+        print_json(&Value::Array(rows.to_vec()));
+        return;
+    }
+    if rows.is_empty() {
+        println!();
+        println!("  {}", "nothing to report".dimmed());
+        return;
+    }
+
+    let width = rows
+        .iter()
+        .map(|f| str_at(f, "severity").chars().count())
+        .max()
+        .unwrap_or(0);
+
+    println!();
+    for f in rows {
+        let sev = str_at(f, "severity");
+        println!(
+            "  {}  {}  {}",
+            format!("{sev:<width$}").bold().color(severity_color(&sev)),
+            str_at(f, "area").dimmed(),
+            str_at(f, "finding")
+        );
+        let detail = str_at(f, "detail");
+        if !detail.is_empty() {
+            // Indented under the sentence it belongs to, and wrapped rather
+            // than clipped, because these are the names to act on.
+            for line in wrap(&detail, 88) {
+                println!("  {}{}", " ".repeat(width + 2), line.dimmed());
+            }
+        }
+    }
+}
+
+fn severity_color(sev: &str) -> colored::Color {
+    match sev {
+        "high" => colored::Color::Red,
+        "medium" => colored::Color::Yellow,
+        "low" => colored::Color::Cyan,
+        _ => colored::Color::White,
+    }
+}
+
+fn str_at(v: &Value, k: &str) -> String {
+    v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Break a comma-separated detail into lines of at most `width` characters,
+/// on separator boundaries so no name is split in half.
+fn wrap(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for part in s.split(", ") {
+        if !cur.is_empty() && cur.chars().count() + 2 + part.chars().count() > width {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str(", ");
+        }
+        cur.push_str(part);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
 
 /// A section title, printed above a block.
 pub fn heading(text: &str) {
@@ -388,8 +506,8 @@ fn tint(s: &str) -> colored::ColoredString {
         "high" => s.red(),
         "medium" | "weak" => s.yellow(),
         "low" | "info" | "unknown" | "none" => s.dimmed(),
-        "allow" => s.green(),
-        "deny" | "block" => s.red(),
+        "allow" | "read" => s.green(),
+        "deny" | "block" | "failed" | "write" => s.red(),
         "" => s.normal(),
         _ => s.normal(),
     }
@@ -573,6 +691,25 @@ mod tests {
             "[{\"a\":1}]",
             "objects still fall back to JSON"
         );
+    }
+
+    #[test]
+    fn a_detail_wraps_on_separators_rather_than_mid_name() {
+        let names = "alice@example.com, bob@example.com, carol@example.com";
+        let lines = wrap(names, 40);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("bob@example.com"), "{lines:?}");
+        assert!(
+            lines.iter().all(|l| !l.starts_with(',')),
+            "no line starts on a separator: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_item_longer_than_the_width_still_gets_its_own_line() {
+        // Better one over-long line than a truncated address.
+        let one = "a-very-long-address@some-extremely-long-domain.example.com";
+        assert_eq!(wrap(one, 20), vec![one.to_string()]);
     }
 
     #[test]

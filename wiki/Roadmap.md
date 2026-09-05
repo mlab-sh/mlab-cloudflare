@@ -17,16 +17,20 @@ are holding and what it reaches.
 - `api` — the raw handler, with paging, cursor paging and `--redact`
 - Envelope checking, bounded retry on `429`/`5xx`, no redirect following
 
-## Phase 2 — identity
+## Phase 2 — identity — **done**
 
-The token inventory across both stores, members and roles with their
-two-factor state, pending invitations, account-owned tokens, SSO and SCIM
-coverage, resource shares, and the audit-log queries that matter (failed
-actions, deletes, changes made by a token rather than a person).
+The graded-check engine (`audit.rs`: severities, findings, the pure functions
+over fetched data) plus the two commands that use it.
 
-Bounded, high value, and it needs no zone iteration.
+- [`identity`](Identity) — members and their privileges as the union across
+  their roles, tokens from both stores graded for writes, expiry, blanket
+  scope and use, and SSO/SCIM coverage including directory users who were
+  deactivated and still hold access
+- [`activity`](Activity) — the audit log, with the queries that matter
+- **Not read is not clean**: every refused read is listed, and never counted as
+  a pass
 
-## Phase 3 — DNS
+## Phase 3 — DNS and the namespace
 
 The densest findings on the platform, and the phase that most benefits from
 covering a whole portfolio rather than one domain: dangling records pointing at
@@ -44,23 +48,57 @@ ruleset phase entrypoints and the legacy firewall surfaces, to establish what
 actually executes and in what order — which is not what the dashboard shows
 when rules exist in both engines.
 
-## Phase 5 — the developer platform
+## Phase 5 — certificates and origin trust
+
+Small, and it turns a DNS finding into an exposure: without Authenticated
+Origin Pulls, every leaked origin address is a way in rather than an
+information disclosure. Plus the certificate inventory and its expiries.
+
+## Phase 6 — the developer platform
 
 Workers and their bindings, the `workers.dev` exposure that bypasses every
 zone-level rule, Pages preview configurations holding production bindings, R2
-buckets served publicly on `r2.dev`.
+buckets served publicly on `r2.dev`, Hyperdrive connection details, Turnstile
+widgets. The first phase where the rate ceiling shapes the design.
 
-## Phase 6 — Zero Trust
+## Phase 7 — Zero Trust
 
 Access policies, Gateway rules, split-tunnel exclusions, tunnel ingress. The
 largest read, and the one that has to degrade cleanly when the entitlement is
-absent — which is most accounts.
+absent — which is most accounts. Redaction is mandatory here: a tunnel's token
+endpoint returns a live connector credential.
 
-## Phase 7 — snapshot and diff
+## Phase 8 — egress, logging and alerting
+
+Where request data goes and whether anyone is told when something breaks:
+Logpush destinations and their field lists, notification policies against the
+available alert types, silences never restored, webhook destinations failing
+since months, log retention and data residency.
+
+## Phase 9 — network
+
+Only on accounts that bought Magic Transit or WAN: site ACLs, tunnels, static
+routes, BYOIP prefixes, DNS Firewall clusters, load balancer pools.
+
+## Phase 10 — snapshot and diff
 
 Everything above, redacted and written to one dated file, then compared.
 Configuration drift is the finding no single read can produce, and the audit
 log's retention horizon is the argument for recording before it is needed.
+
+Needs every earlier phase to expose its reads as data rather than only as
+rendering, which is why each one keeps its gather step separate from its
+report.
+
+## Phase 11 — the whole report, and shipping it
+
+One `audit` command across every plane, entitlement-aware so a plan gap never
+reads as a misconfiguration, with an exit code a CI gate can act on and the
+unread list as a first-class section of the output.
+
+Then release: the `.deb` and `.rpm` metadata already in `Cargo.toml` wired to a
+pipeline, a Homebrew formula, checksummed tarballs per target. The wiki sync is
+already running.
 
 ## Not planned
 

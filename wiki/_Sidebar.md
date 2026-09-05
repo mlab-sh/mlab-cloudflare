@@ -5,6 +5,8 @@
 
 **Commands**
 - [whoami](Whoami)
+- [identity](Identity)
+- [activity](Activity)
 - [login](Login)
 - [ping](Ping)
 - [accounts](Accounts)
