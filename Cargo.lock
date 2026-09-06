@@ -589,6 +589,7 @@ dependencies = [
  "anyhow",
  "clap",
  "colored",
+ "futures-util",
  "reqwest",
  "rpassword",
  "serde",

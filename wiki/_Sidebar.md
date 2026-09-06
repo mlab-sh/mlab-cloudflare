@@ -8,6 +8,7 @@
 - [dns](Dns)
 - [posture](Posture)
 - [tls](Tls)
+- [platform](Platform)
 - [identity](Identity)
 - [activity](Activity)
 - [login](Login)

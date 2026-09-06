@@ -183,6 +183,30 @@ pub const HOSTNAME_COLS: &[Col] = &[
     Col("EXPIRES", &["expires"]),
 ];
 
+/// Worker scripts, and the two facts that decide what each one is.
+pub const WORKER_COLS: &[Col] = &[
+    Col("SCRIPT", &["script"]),
+    Col("WORKERS.DEV", &["workersDev"]),
+    Col("ZONE ROUTE", &["route"]),
+    Col("BINDINGS", &["bindings"]),
+    Col("REACHES", &["reaches"]),
+    Col("LOGS", &["logs"]),
+];
+
+pub const STORE_COLS: &[Col] = &[
+    Col("KIND", &["kind"]),
+    Col("NAME", &["name"]),
+    Col("DETAIL", &["detail"]),
+];
+
+pub const PAGES_COLS: &[Col] = &[
+    Col("PROJECT", &["project"]),
+    Col("HOSTNAME", &["subdomain"]),
+    Col("BRANCH", &["branch"]),
+    Col("SOURCE", &["source"]),
+    Col("AUTO-BUILD", &["autoBuild"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),

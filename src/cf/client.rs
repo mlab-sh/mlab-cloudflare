@@ -18,8 +18,17 @@ use crate::cf::config::{Auth, Profile};
 const MAX_RESPONSE_BYTES: usize = 64 << 20;
 
 /// Default page size. The API caps most collections at 100 per page and a few
-/// (zones) at 50, so this is the largest value that is safe everywhere.
+/// (zones) at 50.
 const PAGE_SIZE: u32 = 50;
+
+/// The size to fall back to when an endpoint rejects [`PAGE_SIZE`].
+///
+/// A few endpoints validate list options strictly rather than ignoring what
+/// they do not use: `/accounts/{id}/pages/projects` answers `400 Invalid list
+/// options provided` for a `per_page` of 25 or 50, and accepts 10. Rather than
+/// slow every collection down to that, the first refusal drops this one call to
+/// a size the strict endpoints take.
+const STRICT_PAGE_SIZE: u32 = 10;
 
 /// Base URL, overridable through `CLOUDFLARE_API_URL` for testing.
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
@@ -400,7 +409,7 @@ impl Client {
         query: &[(String, String)],
         limit: Option<u32>,
     ) -> Result<Vec<Value>> {
-        let per_page = limit.unwrap_or(PAGE_SIZE);
+        let mut per_page = limit.unwrap_or(PAGE_SIZE);
         let mut out = Vec::new();
         let mut page = 1u32;
 
@@ -409,7 +418,20 @@ impl Client {
             q.push(("page".into(), page.to_string()));
             q.push(("per_page".into(), per_page.to_string()));
 
-            let env = self.envelope(Method::GET, path, &q, None).await?;
+            let env = match self.envelope(Method::GET, path, &q, None).await {
+                Ok(env) => env,
+                // A few endpoints validate list options rather than ignoring
+                // the ones they do not use, and refuse a page size they
+                // consider too large. Ask the same page again at a size they
+                // take, rather than slowing every other collection to it.
+                Err(e) if limit.is_none() && per_page > STRICT_PAGE_SIZE && rejects_paging(&e) => {
+                    per_page = STRICT_PAGE_SIZE;
+                    q.pop();
+                    q.push(("per_page".into(), per_page.to_string()));
+                    self.envelope(Method::GET, path, &q, None).await?
+                }
+                Err(e) => return Err(e),
+            };
             let items = array_of(&result_of(env.clone()));
             let got = items.len();
             out.extend(items);
@@ -465,6 +487,19 @@ impl Client {
         }
         Ok(out)
     }
+}
+
+/// Whether a refusal is the endpoint objecting to the page size we asked for.
+///
+/// Matched on the message rather than the status alone: a `400` covers a great
+/// many things, and retrying an unrelated one at a different page size would
+/// only ask a bad question twice.
+fn rejects_paging(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<ApiError>(),
+        Some(a) if a.status == StatusCode::BAD_REQUEST
+            && a.message.to_ascii_lowercase().contains("list options")
+    )
 }
 
 /// Whether a refusal is a fact rather than a moment, and so worth remembering.
@@ -614,10 +649,20 @@ fn error_chain(e: &dyn std::error::Error) -> String {
 }
 
 /// A JSON value as a vector: arrays pass through, `null` is empty.
+///
+/// One shape needs unwrapping. A few collections arrive nested under a single
+/// name — `/r2/buckets` answers `{"buckets": [...]}` rather than an array — and
+/// treating that as one item makes ten buckets read as one. The rule is
+/// deliberately narrow: an object with exactly one field, whose value is an
+/// array. Anything else is a single object and stays one.
 pub fn array_of(v: &Value) -> Vec<Value> {
     match v {
         Value::Array(a) => a.clone(),
         Value::Null => Vec::new(),
+        Value::Object(map) if map.len() == 1 => match map.values().next() {
+            Some(Value::Array(a)) => a.clone(),
+            _ => vec![v.clone()],
+        },
         other => vec![other.clone()],
     }
 }
@@ -717,6 +762,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_complaint_about_list_options_reduces_the_page_size() {
+        let err = |status, message: &str| {
+            anyhow::Error::new(ApiError {
+                status,
+                code: 0,
+                message: message.into(),
+                retry_after: None,
+            })
+        };
+        assert!(rejects_paging(&err(
+            StatusCode::BAD_REQUEST,
+            "Invalid list options provided. Review the documentation."
+        )));
+        assert!(
+            !rejects_paging(&err(
+                StatusCode::BAD_REQUEST,
+                "Plan level does not allow this"
+            )),
+            "another 400 is a different problem, and asking it again at page size 10 \
+             only asks a bad question twice"
+        );
+        assert!(!rejects_paging(&err(
+            StatusCode::FORBIDDEN,
+            "Invalid list options"
+        )));
+    }
+
+    #[test]
     fn only_refusals_that_are_facts_are_remembered() {
         let at = |status| ApiError {
             status,
@@ -788,6 +861,28 @@ mod tests {
             array_of(&json!({"id": 1})).len(),
             1,
             "a single object is a list of one"
+        );
+    }
+
+    #[test]
+    fn a_collection_nested_under_one_name_is_the_collection() {
+        // `/r2/buckets` answers this shape; counting it as one item makes ten
+        // buckets read as one.
+        assert_eq!(
+            array_of(&json!({"buckets": [{"name": "a"}, {"name": "b"}]})).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_unwrapping_does_not_swallow_ordinary_objects() {
+        // One field that is not an array, or more than one field: a real object.
+        assert_eq!(array_of(&json!({"subdomain": "acme"})).len(), 1);
+        assert_eq!(array_of(&json!({"names": ["a"], "count": 1})).len(), 1);
+        assert_eq!(
+            array_of(&json!({"hosts": []})).len(),
+            0,
+            "an empty one is empty"
         );
     }
 }

@@ -52,6 +52,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "wrap_help"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 colored = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 rpassword = "7"

@@ -127,6 +127,12 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// What developers provisioned, and what it is reachable on
+    Platform {
+        #[command(subcommand)]
+        cmd: Option<commands::platform::PlatformCmd>,
+    },
+
     /// What browsers are served, and whether the origin will talk to anyone
     Tls {
         #[command(subcommand)]
@@ -212,6 +218,7 @@ pub async fn run() -> Result<()> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Platform { cmd } => commands::platform::run(&c, &ctx, cmd).await,
         Cmd::Tls { cmd } => commands::tls::run(&c, &ctx, cmd).await,
         Cmd::Posture { cmd } => commands::posture::run(&c, &ctx, cmd).await,
         Cmd::Identity { cmd } => commands::identity::run(&c, &ctx, cmd).await,

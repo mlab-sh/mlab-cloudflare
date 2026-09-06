@@ -77,12 +77,19 @@ over fetched data) plus the two commands that use it.
 - The Gateway CA on its own clock, since replacing it is a fleet rollout
 - A refused read is reported neither way — `None` is not evidence
 
-## Phase 6 — the developer platform
+## Phase 6 — the developer platform — **done**
 
-Workers and their bindings, the `workers.dev` exposure that bypasses every
-zone-level rule, Pages preview configurations holding production bindings, R2
-buckets served publicly on `r2.dev`, Hyperdrive connection details, Turnstile
-widgets. The first phase where the rate ceiling shapes the design.
+[`platform`](Platform), with `workers`, `storage` and `pages`.
+
+- The `workers.dev` exposure, split by whether the script also serves a zone
+  route — a bypass and a design respectively — with the bindings named, since
+  the point is that the unprotected door reaches the same data
+- R2 buckets served anonymously on `r2.dev`, Pages previews sharing production
+  bindings, Hyperdrive naming the database estate
+- Stores nothing reaches, with buckets served over HTTP and dead-letter queues
+  excluded, because neither is neglect
+- Six reads in flight at once: one at a time was a minute of round trips for
+  forty scripts
 
 ## Phase 7 — Zero Trust
 

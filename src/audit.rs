@@ -2241,6 +2241,496 @@ fn hosts_of(v: &Value) -> Option<String> {
     })
 }
 
+// ---- the developer platform ------------------------------------------------
+
+/// One Worker script, with the two facts that decide what it is.
+pub struct Script {
+    pub name: String,
+    /// Reachable at `<name>.<subdomain>.workers.dev`.
+    pub on_subdomain: bool,
+    pub previews: bool,
+    pub bindings: Vec<Value>,
+    pub observability: bool,
+    pub logpush: bool,
+}
+
+/// One R2 bucket and how it is published.
+pub struct Bucket {
+    pub name: String,
+    /// The `pub-<hash>.r2.dev` hostname, when anonymous access is switched on.
+    pub public_domain: Option<String>,
+    pub custom_domains: Vec<String>,
+}
+
+/// Everything the developer platform holds on one account.
+pub struct Platform {
+    pub subdomain: String,
+    pub scripts: Vec<Script>,
+    /// Script names bound to at least one zone route.
+    pub routed: BTreeSet<String>,
+    pub pages: Vec<Value>,
+    pub buckets: Vec<Bucket>,
+    pub kv: Vec<Value>,
+    pub d1: Vec<Value>,
+    pub queues: Vec<Value>,
+    pub hyperdrive: Vec<Value>,
+    pub secret_stores: Vec<Value>,
+    pub widgets: Vec<Value>,
+    pub gateways: Vec<Value>,
+}
+
+impl Script {
+    /// The bindings that reach stored data, named by kind.
+    fn data_bindings(&self) -> Vec<String> {
+        self.bindings
+            .iter()
+            .filter(|b| {
+                matches!(
+                    str_of(b, "type").as_str(),
+                    "kv_namespace"
+                        | "d1"
+                        | "r2_bucket"
+                        | "queue"
+                        | "hyperdrive"
+                        | "durable_object_namespace"
+                        | "secret_text"
+                        | "secrets_store_secret"
+                        | "vectorize"
+                )
+            })
+            .map(|b| format!("{} ({})", str_of(b, "name"), str_of(b, "type")))
+            .collect()
+    }
+}
+
+/// What each Worker is reachable on, and with what.
+///
+/// The finding almost nobody checks: a Worker meant to serve a zone route is
+/// *also* answering at `<name>.<subdomain>.workers.dev` unless that is switched
+/// off per script. Traffic arriving there never touches the zone, so every
+/// custom rule, rate limit, bot policy and Access application configured on the
+/// domain is absent — while the script's bindings to production data are
+/// identical.
+pub fn workers(p: &Platform) -> Vec<Finding> {
+    let mut bypass = Vec::new();
+    let mut only = Vec::new();
+    let mut previews = Vec::new();
+    let mut blind = Vec::new();
+
+    let at = |s: &Script| {
+        if p.subdomain.is_empty() {
+            s.name.clone()
+        } else {
+            format!("{}.{}.workers.dev", s.name, p.subdomain)
+        }
+    };
+
+    for s in &p.scripts {
+        if s.on_subdomain {
+            let data = s.data_bindings();
+            let line = if data.is_empty() {
+                at(s)
+            } else {
+                format!("{} — {}", at(s), data.join(", "))
+            };
+            // A script that also serves a zone route has a protected path and
+            // an unprotected one for the same code. A script with no route is
+            // reachable only here, which is a design rather than a bypass.
+            if p.routed.contains(&s.name) {
+                bypass.push(line);
+            } else {
+                only.push(line);
+            }
+        }
+        if s.previews {
+            previews.push(s.name.clone());
+        }
+        if !s.observability && !s.logpush {
+            blind.push(s.name.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "workers", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} {} a zone route and {} also answering on workers.dev, where no rule of \
+             that zone applies and the bindings are the same",
+            bypass.len(),
+            agree(bypass.len(), "script serves", "scripts serve"),
+            agree(bypass.len(), "is", "are")
+        ),
+        bypass.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} only on workers.dev, so nothing configured on any zone protects {}",
+            only.len(),
+            agree(only.len(), "script answers", "scripts answer"),
+            agree(only.len(), "it", "them")
+        ),
+        only.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} preview URLs enabled, which publishes every version on a second \
+             workers.dev hostname",
+            previews.len(),
+            agree(previews.len(), "script has", "scripts have")
+        ),
+        previews.clone(),
+    );
+    push(
+        Severity::Low,
+        format!(
+            "{} {} neither observability nor logpush, so nothing records what {} did",
+            blind.len(),
+            agree(blind.len(), "script has", "scripts have"),
+            agree(blind.len(), "it", "they")
+        ),
+        blind.clone(),
+    );
+    out
+}
+
+/// Where the data is, who reaches it, and what nothing reaches.
+pub fn storage(p: &Platform) -> Vec<Finding> {
+    let mut public = Vec::new();
+    let mut custom = Vec::new();
+    let mut databases = Vec::new();
+
+    for b in &p.buckets {
+        if let Some(domain) = &b.public_domain {
+            public.push(format!("{} → {domain}", b.name));
+        }
+        for d in &b.custom_domains {
+            custom.push(format!("{} → {d}", b.name));
+        }
+    }
+    for h in &p.hyperdrive {
+        let origin = h.get("origin");
+        databases.push(format!(
+            "{} → {}",
+            str_of(h, "name"),
+            origin
+                .map(|o| format!(
+                    "{}:{}/{}",
+                    str_of(o, "host"),
+                    o.get("port").map(|v| v.to_string()).unwrap_or_default(),
+                    str_of(o, "database")
+                ))
+                .unwrap_or_else(|| "(origin not readable)".into())
+        ));
+    }
+
+    // What nothing is bound to. Every binding across every script names the
+    // store it reaches, so the stores nobody names fall out by subtraction.
+    let bound: BTreeSet<String> = p
+        .scripts
+        .iter()
+        .flat_map(|s| s.bindings.iter())
+        .flat_map(|b| {
+            [
+                "namespace_id",
+                "id",
+                "bucket_name",
+                "queue_name",
+                "store_id",
+            ]
+            .iter()
+            .filter_map(|k| b.get(*k).and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut orphans = Vec::new();
+    // Each kind is matched on the identifier a binding actually carries, which
+    // is not always the one the listing calls primary: a queue binding names
+    // the queue, not its id.
+    for (kind, items, keys) in [
+        ("KV namespace", &p.kv, ["id", "title"]),
+        ("D1 database", &p.d1, ["uuid", "name"]),
+    ] {
+        for it in items {
+            let id = str_of(it, keys[0]);
+            if !id.is_empty() && !bound.contains(&id) {
+                orphans.push(format!("{kind} {}", str_of(it, keys[1])));
+            }
+        }
+    }
+
+    // A queue answers the question itself, and better than a binding scan can:
+    // it lists its own producers and consumers, and a dead-letter queue is
+    // named by the consumer that spills into it rather than bound by anyone.
+    let dead_letter: BTreeSet<String> = p
+        .queues
+        .iter()
+        .flat_map(|q| {
+            q.get("consumers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .map(|cons| str_of(&cons, "dead_letter_queue"))
+        .filter(|d| !d.is_empty())
+        .collect();
+    for q in &p.queues {
+        let name = str_of(q, "queue_name");
+        let attached = |k: &str| {
+            q.get(k)
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty())
+        };
+        if !attached("producers") && !attached("consumers") && !dead_letter.contains(&name) {
+            orphans.push(format!("queue {name}"));
+        }
+    }
+    for b in &p.buckets {
+        // A bucket published on a domain is reached over HTTP rather than
+        // through a binding, so no binding is the design and not neglect.
+        let served = b.public_domain.is_some() || !b.custom_domains.is_empty();
+        if !served && !bound.contains(&b.name) {
+            orphans.push(format!("R2 bucket {}", b.name));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "storage", text).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} R2 {} served anonymously on r2.dev, which publishes the whole bucket to \
+             anyone with the hostname",
+            public.len(),
+            agree(public.len(), "bucket is", "buckets are")
+        ),
+        public.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} R2 {} served on a custom domain",
+            custom.len(),
+            agree(custom.len(), "bucket is", "buckets are")
+        ),
+        custom.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} Hyperdrive {} to a database outside Cloudflare",
+            databases.len(),
+            agree(databases.len(), "config points", "configs point")
+        ),
+        databases.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} data {} bound to no Worker: an unmaintained copy of something, and a cost \
+             line",
+            orphans.len(),
+            agree(orphans.len(), "store is", "stores are")
+        ),
+        orphans.clone(),
+    );
+    out
+}
+
+/// Pages projects, where the preview is the surface people forget.
+pub fn pages(projects: &[Value]) -> Vec<Finding> {
+    let mut shared = Vec::new();
+    let mut public = Vec::new();
+    let mut auto_build = Vec::new();
+
+    for p in projects {
+        let name = str_of(p, "name");
+        let cfg = |env: &str| p.get("deployment_configs").and_then(|c| c.get(env));
+
+        // The mistake this check exists for: a preview configuration carrying
+        // the same bindings as production, while every pull request publishes a
+        // reachable *.pages.dev URL that no Access policy covers.
+        let (prod, prev) = (cfg("production"), cfg("preview"));
+        let shared_names = shared_bindings(prod, prev);
+        if !shared_names.is_empty() {
+            shared.push(format!("{name}: {}", shared_names.join(", ")));
+        }
+
+        let subdomain = str_of(p, "subdomain");
+        if !subdomain.is_empty() {
+            public.push(format!("{name} → {subdomain}"));
+        }
+        if p.get("source")
+            .and_then(|s| s.get("config"))
+            .and_then(|c| c.get("deployments_enabled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            auto_build.push(name);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "pages", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} Pages {} the same bindings in preview as in production, while every branch \
+             publishes a reachable pages.dev URL",
+            shared.len(),
+            agree(shared.len(), "project holds", "projects hold")
+        ),
+        shared.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} Pages {} a public pages.dev hostname",
+            public.len(),
+            agree(public.len(), "project has", "projects have")
+        ),
+        public.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} Pages {} on push, so a branch becomes a published URL without review",
+            auto_build.len(),
+            agree(auto_build.len(), "project builds", "projects build")
+        ),
+        auto_build.clone(),
+    );
+    out
+}
+
+/// The binding names a preview configuration shares with production.
+fn shared_bindings(production: Option<&Value>, preview: Option<&Value>) -> Vec<String> {
+    let names = |cfg: Option<&Value>| -> BTreeSet<String> {
+        let Some(Value::Object(map)) = cfg else {
+            return BTreeSet::new();
+        };
+        // Bindings sit under one key per kind, each an object of name to
+        // target: d1_databases, kv_namespaces, r2_buckets, queue_producers…
+        map.iter()
+            .filter(|(k, _)| k.ends_with('s') && !k.starts_with("env_vars"))
+            .filter_map(|(k, v)| v.as_object().map(|o| (k, o)))
+            .flat_map(|(kind, o)| {
+                o.iter()
+                    .filter_map(move |(name, target)| {
+                        target_id(target).map(|id| format!("{kind}.{name}={id}"))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    names(production)
+        .intersection(&names(preview))
+        .cloned()
+        .collect()
+}
+
+/// The identifier a Pages binding points at, whatever it is called.
+fn target_id(target: &Value) -> Option<String> {
+    for key in ["id", "namespace_id", "name", "queue_name", "database_id"] {
+        if let Some(v) = target.get(key).and_then(Value::as_str) {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The smaller services that sit beside the platform.
+pub fn services(p: &Platform) -> Vec<Finding> {
+    let mut wildcard = Vec::new();
+    let mut open_gateway = Vec::new();
+    let mut logging = Vec::new();
+
+    for w in &p.widgets {
+        let domains: Vec<String> = w
+            .get("domains")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A widget bound to a wildcard can be embedded on any host under it and
+        // solved against your site key.
+        if domains.iter().any(|d| d.starts_with('*') || d.is_empty()) {
+            wildcard.push(format!("{} ({})", str_of(w, "name"), domains.join(", ")));
+        }
+    }
+
+    for g in &p.gateways {
+        let id = str_of(g, "id");
+        if g.get("authentication").and_then(Value::as_bool) == Some(false) {
+            open_gateway.push(id.clone());
+        }
+        if g.get("collect_logs").and_then(Value::as_bool) == Some(true) {
+            logging.push(id);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "services", text).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} AI {} without authentication, which is an open proxy to the model \
+             credentials behind it, billed to this account",
+            open_gateway.len(),
+            agree(open_gateway.len(), "gateway answers", "gateways answer")
+        ),
+        open_gateway.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} Turnstile {} a wildcard or empty domain, so it can be embedded anywhere \
+             under it and solved against this account's key",
+            wildcard.len(),
+            agree(wildcard.len(), "widget allows", "widgets allow")
+        ),
+        wildcard.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} AI {} prompts and completions",
+            logging.len(),
+            agree(logging.len(), "gateway retains", "gateways retain")
+        ),
+        logging.clone(),
+    );
+    out
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -3463,6 +3953,222 @@ mod tests {
             published_origins(&records),
             vec!["direct.a.test → 198.18.0.9"]
         );
+    }
+
+    // ---- the developer platform ----------------------------------------------
+
+    fn script(name: &str, on_subdomain: bool, bindings: Value) -> Script {
+        Script {
+            name: name.to_string(),
+            on_subdomain,
+            previews: false,
+            bindings: bindings.as_array().cloned().unwrap_or_default(),
+            observability: true,
+            logpush: false,
+        }
+    }
+
+    fn platform(scripts: Vec<Script>, routed: &[&str]) -> Platform {
+        Platform {
+            subdomain: "acme".into(),
+            scripts,
+            routed: routed.iter().map(|s| s.to_string()).collect(),
+            pages: vec![],
+            buckets: vec![],
+            kv: vec![],
+            d1: vec![],
+            queues: vec![],
+            hyperdrive: vec![],
+            secret_stores: vec![],
+            widgets: vec![],
+            gateways: vec![],
+        }
+    }
+
+    #[test]
+    fn a_worker_on_a_route_and_on_workers_dev_is_the_bypass() {
+        // Two doors to the same code: one behind the zone's rules, one not.
+        let p = platform(
+            vec![script(
+                "api",
+                true,
+                json!([{"name": "DB", "type": "d1", "id": "d-1"}]),
+            )],
+            &["api"],
+        );
+        let f = workers(&p);
+        let hit = f.iter().find(|f| f.finding.contains("zone route")).unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(
+            hit.detail.contains("api.acme.workers.dev"),
+            "{}",
+            hit.detail
+        );
+        assert!(
+            hit.detail.contains("DB (d1)"),
+            "the bindings are the point: the unprotected door reaches the same data"
+        );
+    }
+
+    #[test]
+    fn a_worker_only_on_workers_dev_is_a_design_rather_than_a_bypass() {
+        // Nothing was routed away from; workers.dev is simply where it lives.
+        let p = platform(vec![script("tool", true, json!([]))], &[]);
+        let f = workers(&p);
+        assert!(!has(&f, "zone route"));
+        assert_eq!(at(&f, "only on workers.dev"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_worker_that_is_not_published_is_not_reported_at_all() {
+        let p = platform(vec![script("private", false, json!([]))], &["private"]);
+        let f = workers(&p);
+        assert!(!has(&f, "workers.dev"));
+    }
+
+    #[test]
+    fn a_bucket_reached_over_http_is_not_an_orphan() {
+        // No binding names it because nothing binds it: it is served on a
+        // domain. Calling that neglect would be wrong.
+        let mut p = platform(vec![], &[]);
+        p.buckets = vec![
+            Bucket {
+                name: "served".into(),
+                public_domain: None,
+                custom_domains: vec!["cdn.example.com".into()],
+            },
+            Bucket {
+                name: "forgotten".into(),
+                public_domain: None,
+                custom_domains: vec![],
+            },
+        ];
+        let f = storage(&p);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("bound to no Worker"))
+            .unwrap();
+        assert!(hit.detail.contains("forgotten"));
+        assert!(!hit.detail.contains("served"));
+    }
+
+    #[test]
+    fn a_public_bucket_outranks_everything_else_in_the_plane() {
+        let mut p = platform(vec![], &[]);
+        p.buckets = vec![Bucket {
+            name: "open".into(),
+            public_domain: Some("pub-abc.r2.dev".into()),
+            custom_domains: vec![],
+        }];
+        let f = storage(&p);
+        assert_eq!(at(&f, "served anonymously on r2.dev"), Severity::High);
+        assert!(f.iter().any(|f| f.detail.contains("pub-abc.r2.dev")));
+    }
+
+    #[test]
+    fn a_queue_answers_for_itself_rather_than_through_a_binding() {
+        // Producers and consumers are on the queue, and a dead-letter queue is
+        // named by the consumer that spills into it — no binding mentions it.
+        let mut p = platform(vec![], &[]);
+        p.queues = vec![
+            json!({
+                "queue_name": "work",
+                "producers": [{"script": "a"}],
+                "consumers": [{"script": "b", "dead_letter_queue": "work-dlq"}]
+            }),
+            json!({"queue_name": "work-dlq", "producers": [], "consumers": []}),
+            json!({"queue_name": "abandoned", "producers": [], "consumers": []}),
+        ];
+        let f = storage(&p);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("bound to no Worker"))
+            .unwrap();
+        assert!(hit.detail.contains("queue abandoned"));
+        assert!(
+            !hit.detail.contains("work-dlq"),
+            "a dead-letter queue is in use"
+        );
+        assert!(!hit.detail.contains("queue work"), "{}", hit.detail);
+    }
+
+    #[test]
+    fn a_store_a_worker_binds_is_not_an_orphan() {
+        let p = Platform {
+            kv: vec![json!({"id": "kv-1", "title": "cache"})],
+            d1: vec![json!({"uuid": "db-1", "name": "main"})],
+            ..platform(
+                vec![script(
+                    "api",
+                    false,
+                    json!([
+                        {"name": "CACHE", "type": "kv_namespace", "namespace_id": "kv-1"},
+                        {"name": "DB", "type": "d1", "id": "db-1"}
+                    ]),
+                )],
+                &[],
+            )
+        };
+        assert!(!has(&storage(&p), "bound to no Worker"));
+    }
+
+    #[test]
+    fn a_preview_sharing_production_bindings_is_the_pages_finding() {
+        // Every branch publishes a reachable URL; the bindings decide what that
+        // URL can reach.
+        let shared = json!([{
+            "name": "app",
+            "subdomain": "app.pages.dev",
+            "deployment_configs": {
+                "production": {"d1_databases": {"DB": {"id": "prod-db"}}},
+                "preview": {"d1_databases": {"DB": {"id": "prod-db"}}}
+            }
+        }]);
+        let f = pages(shared.as_array().unwrap());
+        assert_eq!(at(&f, "same bindings in preview"), Severity::High);
+
+        let separate = json!([{
+            "name": "app",
+            "subdomain": "app.pages.dev",
+            "deployment_configs": {
+                "production": {"d1_databases": {"DB": {"id": "prod-db"}}},
+                "preview": {"d1_databases": {"DB": {"id": "staging-db"}}}
+            }
+        }]);
+        assert!(!has(
+            &pages(separate.as_array().unwrap()),
+            "same bindings in preview"
+        ));
+    }
+
+    #[test]
+    fn an_ai_gateway_without_authentication_is_an_open_proxy() {
+        let mut p = platform(vec![], &[]);
+        p.gateways = vec![
+            json!({"id": "open", "authentication": false, "collect_logs": true}),
+            json!({"id": "closed", "authentication": true, "collect_logs": false}),
+        ];
+        let f = services(&p);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("without authentication"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert_eq!(hit.detail, "open");
+        assert_eq!(at(&f, "retains prompts"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_turnstile_widget_bound_to_a_wildcard_can_be_embedded_anywhere_under_it() {
+        let mut p = platform(vec![], &[]);
+        p.widgets = vec![
+            json!({"name": "wide", "domains": ["*.example.com"]}),
+            json!({"name": "narrow", "domains": ["app.example.com"]}),
+        ];
+        let f = services(&p);
+        let hit = f.iter().find(|f| f.finding.contains("wildcard")).unwrap();
+        assert!(hit.detail.contains("wide"));
+        assert!(!hit.detail.contains("narrow"));
     }
 
     // ---- ordering -----------------------------------------------------------

@@ -24,6 +24,7 @@ unless a command says it does and you pass the flag that allows it.
 | [`dns`](Dns) | What the zones point at, and what points nowhere. Graded. |
 | [`posture`](Posture) | What the edge enforces, and what is carved out of it. Graded. |
 | [`tls`](Tls) | What browsers are served, and whether the origin will talk to anyone. Graded. |
+| [`platform`](Platform) | What developers provisioned, and what it is reachable on. Graded. |
 | [`identity`](Identity) | Who can change this account, and with what. Graded. |
 | [`activity`](Activity) | What was actually done to this account, and by whom. |
 | [`api`](Api) | Raw request against any endpoint, for everything not wrapped yet. |
