@@ -16,6 +16,7 @@ unless a command says it does and you pass the flag that allows it.
 
 | Command | What it does |
 | --- | --- |
+| [`audit`](Audit) | Every plane, one graded report, one exit code. |
 | [`whoami`](Whoami) | What this credential is, and exactly what it may do. Start here. |
 | [`login`](Login) | Create or update a profile, prove the credential works, save it. |
 | [`ping`](Ping) | Check that the current profile reaches the API. |

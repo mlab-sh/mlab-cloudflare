@@ -505,9 +505,15 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in both halves of this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    let e = gather_egress(c, ctx, &account).await?;
+    let a = gather_alerts(c, &account).await?;
+    Ok([audit::egress(&e), audit::alerting(&a)].concat())
+}
+
 /// Read everything both halves of this plane need, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let account = scope::account(c, &ctx.profile.account).await?;
-    gather_egress(c, ctx, &account).await?;
-    gather_alerts(c, &account).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

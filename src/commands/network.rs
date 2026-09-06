@@ -423,8 +423,25 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+///
+/// An account that routes nothing through Cloudflare contributes nothing.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    let n = gather(c, &account).await?;
+    if n.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok([
+        audit::magic(&n),
+        audit::addressing(&n),
+        audit::balancing(&n),
+        audit::dns_firewall(&n),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let account = scope::account(c, &ctx.profile.account).await?;
-    gather(c, &account).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

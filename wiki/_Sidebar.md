@@ -4,6 +4,7 @@
 - [Install](Install)
 
 **Commands**
+- [audit](Audit)
 - [whoami](Whoami)
 - [dns](Dns)
 - [posture](Posture)

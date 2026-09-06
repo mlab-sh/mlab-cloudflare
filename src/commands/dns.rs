@@ -344,11 +344,23 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
+    let read = gather(c, &zones, true).await?;
+    Ok([
+        audit::takeover(&read),
+        audit::exposure(&read),
+        audit::namespace(&read),
+        audit::mail(&read),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 ///
-/// The result is discarded on purpose: what a snapshot keeps is what the API
+/// The findings are discarded on purpose: what a snapshot keeps is what the API
 /// said, which the client records on the way past.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let zones = crate::commands::zones_in_scope(c, ctx).await?;
-    gather(c, &zones, true).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

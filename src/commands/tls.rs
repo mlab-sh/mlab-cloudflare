@@ -361,10 +361,21 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
+    let read = gather(c, &zones).await?;
+    let account_certs = account_mtls(c, ctx).await;
+    Ok([
+        audit::origin_trust(&read),
+        audit::certificates(&read, 30),
+        audit::hostnames(&read),
+        audit::account_certificates(&account_certs, 30),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let zones = crate::commands::zones_in_scope(c, ctx).await?;
-    gather(c, &zones).await?;
-    account_mtls(c, ctx).await;
-    Ok(())
+    findings(c, ctx).await.map(|_| ())
 }

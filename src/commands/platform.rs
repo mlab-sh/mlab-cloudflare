@@ -427,8 +427,20 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    let p = gather(c, ctx, &account).await?;
+    Ok([
+        audit::workers(&p),
+        audit::storage(&p),
+        audit::pages(&p.pages),
+        audit::services(&p),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let account = scope::account(c, &ctx.profile.account).await?;
-    gather(c, ctx, &account).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

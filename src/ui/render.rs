@@ -352,6 +352,14 @@ pub const LB_COLS: &[Col] = &[
     Col("FALLBACK", &["fallback"]),
 ];
 
+/// What the whole-account report could not read, one row per endpoint shape.
+pub const AUDIT_UNREAD_COLS: &[Col] = &[
+    Col("ENDPOINT", &["endpoint"]),
+    Col("READS", &["reads"]),
+    Col("CAUSE", &["cause"]),
+    Col("WHY", &["reason"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),
@@ -811,7 +819,8 @@ fn tint(s: &str) -> colored::ColoredString {
         "critical" => s.red().bold(),
         "high" => s.red(),
         "medium" | "weak" => s.yellow(),
-        "low" | "info" | "unknown" | "none" | "stale" => s.dimmed(),
+        "low" | "info" | "unknown" | "none" | "stale" | "plan" => s.dimmed(),
+        "permission" => s.yellow(),
         "allow" | "read" | "-all" | "p=reject" => s.green(),
         "bypass" | "everyone" => s.red().bold(),
         "deny" | "block" | "failed" | "write" | "+all" | "?all" | "flexible"

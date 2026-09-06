@@ -159,15 +159,24 @@ over fetched data) plus the two commands that use it.
 - Nine `collect` entry points, and one implementation of "the zones this run
   covers" where there had been four
 
-## Phase 11 — the whole report, and shipping it
+## Phase 11a — the whole report — **done**
 
-One `audit` command across every plane, entitlement-aware so a plan gap never
-reads as a misconfiguration, with an exit code a CI gate can act on and the
-unread list as a first-class section of the output.
+[`audit`](Audit).
 
-Then release: the `.deb` and `.rpm` metadata already in `Cargo.toml` wired to a
-pipeline, a Homebrew formula, checksummed tarballs per target. The wiki sync is
-already running.
+- Every plane, one graded document, worst first, with the worst five of each
+  severity shown and `info` dropped from the short view
+- An exit code a gate can act on: `2` for findings, `1` for the tool failing,
+  because a gate that cannot tell them apart gets switched off
+- The unread list built from the recorder rather than per plane, so no plane can
+  contribute an empty finding list because its reads were denied
+- Object ids generalised, so nineteen zones refusing one read are one gap
+- The plan and the credential separated, but only where the API says so
+
+## Phase 11b — shipping it
+
+Not started. The `.deb` and `.rpm` metadata is already in `Cargo.toml` and needs
+a pipeline; then a Homebrew formula and checksummed tarballs per target. The
+wiki sync is already running.
 
 ## Not planned
 

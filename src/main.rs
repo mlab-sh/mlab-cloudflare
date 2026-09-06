@@ -22,10 +22,16 @@ use colored::Colorize;
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = cli::run().await {
-        // A spinner may own a half-drawn line; wipe it before the message.
-        ui::restore();
-        eprintln!("  {} {e:#}", "✖".red().bold());
-        std::process::exit(1);
+    match cli::run().await {
+        // Only `audit --fail-on` returns anything but zero, and it returns 2 —
+        // so a pipeline can tell "the audit found things" from "the tool
+        // broke", which is exit 1 below.
+        Ok(code) => std::process::exit(code),
+        Err(e) => {
+            // A spinner may own a half-drawn line; wipe it before the message.
+            ui::restore();
+            eprintln!("  {} {e:#}", "✖".red().bold());
+            std::process::exit(1);
+        }
     }
 }

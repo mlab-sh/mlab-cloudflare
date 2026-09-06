@@ -427,8 +427,27 @@ fn refused<T>(what: &str, r: &Result<T, String>) {
     }
 }
 
+/// Every check in this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    let r = gather(c, &account).await?;
+    let mut out = Vec::new();
+    if let Ok(m) = &r.members {
+        out.extend(audit::members(&r.account, m));
+    }
+    if let Ok(t) = &r.account_tokens {
+        out.extend(audit::tokens(t, "account-owned"));
+    }
+    if let Ok(t) = &r.user_tokens {
+        out.extend(audit::tokens(t, "user-owned"));
+    }
+    if let (Ok(m), Ok(s), Ok(sc)) = (&r.members, &r.sso, &r.scim) {
+        out.extend(audit::directory(m, s, sc));
+    }
+    Ok(out)
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let account = scope::account(c, &ctx.profile.account).await?;
-    gather(c, &account).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

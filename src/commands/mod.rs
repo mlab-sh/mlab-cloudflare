@@ -7,6 +7,7 @@
 pub mod accounts;
 pub mod activity;
 pub mod api;
+pub mod audit;
 pub mod cache;
 pub mod dns;
 pub mod egress;

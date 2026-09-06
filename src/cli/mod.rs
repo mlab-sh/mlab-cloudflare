@@ -127,6 +127,9 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// Every plane, one graded report, one exit code
+    Audit(commands::audit::AuditArgs),
+
     /// One dated, credential-free record of everything the account holds
     Snapshot(commands::snapshot::SnapshotArgs),
 
@@ -213,7 +216,11 @@ pub struct ListArgs {
 }
 
 /// Parse, set up output, then hand over to a command.
-pub async fn run() -> Result<()> {
+///
+/// Returns the process exit code. Only `audit` ever returns anything but zero:
+/// it is the one command whose *result* is a verdict rather than a report, and
+/// a gate has to be able to act on it.
+pub async fn run() -> Result<i32> {
     let cli = Cli::parse();
     ui::init(cli.quiet);
     // Resolved again from the profile in `Ctx::build` when neither the flag nor
@@ -222,12 +229,18 @@ pub async fn run() -> Result<()> {
 
     // Commands that only touch the config file need no credential.
     match &cli.command {
-        Cmd::Login(args) => return commands::login::run(&Overrides::from(&cli), args).await,
-        Cmd::Profile { cmd } => return commands::profile::run(cmd),
-        Cmd::Config { cmd } => return commands::settings::run(cmd),
-        Cmd::Cache { cmd } => return commands::cache::run(cmd, Duration::from_secs(cli.cache_ttl)),
+        Cmd::Login(args) => {
+            return commands::login::run(&Overrides::from(&cli), args)
+                .await
+                .map(|()| 0)
+        }
+        Cmd::Profile { cmd } => return commands::profile::run(cmd).map(|()| 0),
+        Cmd::Config { cmd } => return commands::settings::run(cmd).map(|()| 0),
+        Cmd::Cache { cmd } => {
+            return commands::cache::run(cmd, Duration::from_secs(cli.cache_ttl)).map(|()| 0)
+        }
         // Comparing two files needs no credential and no network.
-        Cmd::Diff(a) => return commands::snapshot::diff(a),
+        Cmd::Diff(a) => return commands::snapshot::diff(a).map(|()| 0),
         _ => {}
     }
 
@@ -243,12 +256,19 @@ pub async fn run() -> Result<()> {
     let c = Client::with_cache(&ctx.profile, ctx.timeout, cache)
         .with_context(|| format!("profile {:?}", ctx.name))?;
 
+    // `audit` is the only command whose result is a verdict; everything else
+    // reports and succeeds.
+    if let Cmd::Audit(a) = &cli.command {
+        return commands::audit::run(&c, &ctx, a).await;
+    }
+
     match cli.command {
         Cmd::Login(_)
         | Cmd::Profile { .. }
         | Cmd::Config { .. }
         | Cmd::Cache { .. }
-        | Cmd::Diff(_) => unreachable!(),
+        | Cmd::Diff(_)
+        | Cmd::Audit(_) => unreachable!(),
         Cmd::Ping => commands::ping::run(&c, &ctx).await,
         Cmd::Whoami => commands::whoami::run(&c, &ctx).await,
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
@@ -266,6 +286,7 @@ pub async fn run() -> Result<()> {
         Cmd::Activity(a) => commands::activity::run(&c, &ctx, &a).await,
         Cmd::Api(a) => commands::api::run(&c, &ctx, a).await,
     }
+    .map(|()| 0)
 }
 
 #[cfg(test)]

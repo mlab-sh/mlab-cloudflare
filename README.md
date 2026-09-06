@@ -1,5 +1,7 @@
 # mlab-cloudflare
 
+![](./.github/banner.png)
+
 **A CLI over the Cloudflare API, built as a base for read-only account and zone
 audit.**
 
@@ -57,6 +59,7 @@ which is where wrangler and the Terraform provider already put them.
 | Command | What it does |
 | --- | --- |
 | `login` | Create or update a profile, prove the credential works, save it. |
+| `audit` | Every plane, one graded report, one exit code. |
 | `whoami` | What this credential is, and exactly what it may do. Start here. |
 | `ping` | Check that the current profile reaches the API. |
 | `accounts` | Accounts this credential reaches. |

@@ -357,8 +357,19 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
+    let read = gather(c, &zones).await?;
+    Ok([
+        audit::transport(&read),
+        audit::enforcement(&read),
+        audit::edge(&read),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let zones = crate::commands::zones_in_scope(c, ctx).await?;
-    gather(c, &zones).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }

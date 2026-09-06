@@ -512,8 +512,26 @@ fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
+/// Every check in this plane, for the whole-account report.
+///
+/// An account without Zero Trust contributes nothing rather than a wall of
+/// findings about a product nobody bought.
+pub(crate) async fn findings(c: &Client, ctx: &Ctx) -> Result<Vec<Finding>> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    let z = gather(c, &account).await?;
+    if is_empty(&z) {
+        return Ok(Vec::new());
+    }
+    Ok([
+        audit::access(&z),
+        audit::gateway(&z),
+        audit::devices(&z),
+        audit::tunnels(&z),
+    ]
+    .concat())
+}
+
 /// Read everything this plane needs, for a snapshot.
 pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
-    let account = scope::account(c, &ctx.profile.account).await?;
-    gather(c, &account).await.map(|_| ())
+    findings(c, ctx).await.map(|_| ())
 }
