@@ -143,15 +143,21 @@ over fetched data) plus the two commands that use it.
   against routes nothing through Cloudflare, so the tests carry it and the
   empty case is what was verified end to end
 
-## Phase 10 — snapshot and diff
+## Phase 10 — snapshot and diff — **done**
 
-Everything above, redacted and written to one dated file, then compared.
-Configuration drift is the finding no single read can produce, and the audit
-log's retention horizon is the argument for recording before it is needed.
+[`snapshot`](Snapshot) and [`diff`](Snapshot).
 
-Needs every earlier phase to expose its reads as data rather than only as
-rendering, which is why each one keeps its gather step separate from its
-report.
+- The record keeps the **responses**, not this tool's reading of them, so a
+  check written next month can be run against a snapshot taken today
+- A recorder on the same path as the cache, which is what makes it capture
+  configuration and never liveness
+- Refusals are recorded: a `403` becoming a body is a permission that was
+  granted, and no findings-shaped record could say that
+- Everything goes through the redaction list on the way to disk
+- Lists diffed by identity rather than position, shown by the name somebody
+  chose, so a rename is a change and an insertion is one row
+- Nine `collect` entry points, and one implementation of "the zones this run
+  covers" where there had been four
 
 ## Phase 11 — the whole report, and shipping it
 

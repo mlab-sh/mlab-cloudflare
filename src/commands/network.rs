@@ -422,3 +422,9 @@ fn observe(findings: Vec<Finding>) {
 fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
+
+/// Read everything this plane needs, for a snapshot.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    gather(c, &account).await.map(|_| ())
+}

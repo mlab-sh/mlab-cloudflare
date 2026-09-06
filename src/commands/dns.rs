@@ -35,17 +35,7 @@ pub enum DnsCmd {
 pub async fn run(c: &Client, ctx: &Ctx, cmd: Option<DnsCmd>) -> Result<()> {
     // The zone-scoped flag narrows to one zone; otherwise the unit is the
     // account, as everywhere else in the tool.
-    let zones = if ctx.profile.zone.is_empty() {
-        let account = scope::account(c, &ctx.profile.account).await?;
-        ui::spin(
-            "Listing zones",
-            c.cached_list("/zones", &[("account.id".to_string(), account)], None),
-        )
-        .await?
-    } else {
-        let id = scope::zone(c, &ctx.profile.zone).await?;
-        vec![c.cached(&format!("/zones/{}", esc(&id)), &[]).await?]
-    };
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
 
     if matches!(cmd, Some(DnsCmd::Domains)) {
         return domains(c, ctx).await;
@@ -352,4 +342,13 @@ fn observe(findings: Vec<Finding>) {
 
 fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read everything this plane needs, for a snapshot.
+///
+/// The result is discarded on purpose: what a snapshot keeps is what the API
+/// said, which the client records on the way past.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
+    gather(c, &zones, true).await.map(|_| ())
 }

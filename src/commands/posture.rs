@@ -14,7 +14,7 @@ use clap::Subcommand;
 use serde_json::{json, Value};
 
 use crate::audit::{self, Finding, Posture};
-use crate::cf::{esc, scope, Client};
+use crate::cf::{esc, Client};
 use crate::cli::Ctx;
 use crate::ui::{self, render};
 
@@ -40,17 +40,7 @@ pub enum PostureCmd {
 }
 
 pub async fn run(c: &Client, ctx: &Ctx, cmd: Option<PostureCmd>) -> Result<()> {
-    let zones = if ctx.profile.zone.is_empty() {
-        let account = scope::account(c, &ctx.profile.account).await?;
-        ui::spin(
-            "Listing zones",
-            c.cached_list("/zones", &[("account.id".to_string(), account)], None),
-        )
-        .await?
-    } else {
-        let id = scope::zone(c, &ctx.profile.zone).await?;
-        vec![c.cached(&format!("/zones/{}", esc(&id)), &[]).await?]
-    };
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
 
     let read = gather(c, &zones).await?;
 
@@ -365,4 +355,10 @@ fn observe(findings: Vec<Finding>) {
 
 fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read everything this plane needs, for a snapshot.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let zones = crate::commands::zones_in_scope(c, ctx).await?;
+    gather(c, &zones).await.map(|_| ())
 }

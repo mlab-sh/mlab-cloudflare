@@ -87,7 +87,9 @@ async fn gather_egress(c: &Client, ctx: &Ctx, account: &str) -> Result<Egress> {
 
     // Zone-level jobs are a separate store from account-level ones, and it is
     // easy to have logs configured at one level and assume the other.
-    let zones = zones_of(c, ctx, account).await;
+    let zones = crate::commands::zones_in_scope(c, ctx)
+        .await
+        .unwrap_or_default();
     let mut retention = Vec::new();
     let (mut zone_job_errors, mut retention_errors) = (Vec::new(), Vec::new());
     for z in &zones {
@@ -158,28 +160,6 @@ fn one_line(e: &anyhow::Error) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
-}
-
-async fn zones_of(c: &Client, ctx: &Ctx, account: &str) -> Vec<Value> {
-    if ctx.profile.zone.is_empty() {
-        c.cached_list(
-            "/zones",
-            &[("account.id".to_string(), account.to_string())],
-            None,
-        )
-        .await
-        .unwrap_or_default()
-    } else {
-        match scope::zone(c, &ctx.profile.zone).await {
-            Ok(id) => c
-                .cached(&format!("/zones/{}", esc(&id)), &[])
-                .await
-                .ok()
-                .into_iter()
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
 }
 
 fn egress_report(e: &Egress) {
@@ -523,4 +503,11 @@ fn observe(findings: Vec<Finding>) {
 
 fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read everything both halves of this plane need, for a snapshot.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    gather_egress(c, ctx, &account).await?;
+    gather_alerts(c, &account).await.map(|_| ())
 }

@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod client;
 pub mod config;
+pub mod record;
 pub mod scope;
 pub mod secrets;
 pub mod token;

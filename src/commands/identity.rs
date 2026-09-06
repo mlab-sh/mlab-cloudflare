@@ -426,3 +426,9 @@ fn refused<T>(what: &str, r: &Result<T, String>) {
         ui::warning(&format!("{what} is not readable: {}", one_line(e)));
     }
 }
+
+/// Read everything this plane needs, for a snapshot.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    gather(c, &account).await.map(|_| ())
+}

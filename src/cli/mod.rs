@@ -127,6 +127,12 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// One dated, credential-free record of everything the account holds
+    Snapshot(commands::snapshot::SnapshotArgs),
+
+    /// What changed between two snapshots
+    Diff(commands::snapshot::DiffArgs),
+
     /// The routed estate: tunnels, static routes, announced space, balancers
     Network {
         #[command(subcommand)]
@@ -220,6 +226,8 @@ pub async fn run() -> Result<()> {
         Cmd::Profile { cmd } => return commands::profile::run(cmd),
         Cmd::Config { cmd } => return commands::settings::run(cmd),
         Cmd::Cache { cmd } => return commands::cache::run(cmd, Duration::from_secs(cli.cache_ttl)),
+        // Comparing two files needs no credential and no network.
+        Cmd::Diff(a) => return commands::snapshot::diff(a),
         _ => {}
     }
 
@@ -236,14 +244,17 @@ pub async fn run() -> Result<()> {
         .with_context(|| format!("profile {:?}", ctx.name))?;
 
     match cli.command {
-        Cmd::Login(_) | Cmd::Profile { .. } | Cmd::Config { .. } | Cmd::Cache { .. } => {
-            unreachable!()
-        }
+        Cmd::Login(_)
+        | Cmd::Profile { .. }
+        | Cmd::Config { .. }
+        | Cmd::Cache { .. }
+        | Cmd::Diff(_) => unreachable!(),
         Cmd::Ping => commands::ping::run(&c, &ctx).await,
         Cmd::Whoami => commands::whoami::run(&c, &ctx).await,
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Snapshot(a) => commands::snapshot::run(&c, &ctx, &a).await,
         Cmd::Network { cmd } => commands::network::run(&c, &ctx, cmd).await,
         Cmd::Egress { cmd } => commands::egress::run_egress(&c, &ctx, cmd).await,
         Cmd::Alerts { cmd } => commands::egress::run_alerts(&c, &ctx, cmd).await,

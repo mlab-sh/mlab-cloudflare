@@ -484,6 +484,28 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// A label with its detail lines underneath, wrapped rather than clipped.
+///
+/// The table renderer clips a cell at the terminal's width, which is right for
+/// an inventory and wrong for a diff: the value that changed is the whole
+/// point, and half of it is worse than none.
+pub fn grouped(groups: &[(String, Vec<String>)]) {
+    if groups.is_empty() {
+        println!();
+        println!("  {}", "nothing to report".dimmed());
+        return;
+    }
+    println!();
+    for (label, lines) in groups {
+        println!("  {}", label.bold());
+        for line in lines {
+            for wrapped in wrap(line, 96) {
+                println!("      {}", tint(&wrapped));
+            }
+        }
+    }
+}
+
 /// A section title, printed above a block.
 pub fn heading(text: &str) {
     if is_json() {
@@ -781,7 +803,9 @@ fn tint(s: &str) -> colored::ColoredString {
         "deactivated" | "deleted" | "expired" | "revoked" | "off" | "unhealthy" | "suspended"
         | "redemption_period" | "pending_delete" => s.red(),
         "redaction" => s.green(),
-        "appeared" => s.yellow(),
+        "appeared" | "read added" | "became readable" => s.yellow(),
+        "no longer read" | "no longer readable" | "removed" => s.dimmed(),
+        "added" => s.green(),
         "disappeared" => s.dimmed(),
         "changed" => s.cyan(),
         "critical" => s.red().bold(),

@@ -11,6 +11,8 @@
 - [platform](Platform)
 - [zerotrust](Zerotrust)
 - [network](Network)
+- [snapshot](Snapshot)
+- [diff](Snapshot)
 - [egress](Egress)
 - [alerts](Egress)
 - [identity](Identity)

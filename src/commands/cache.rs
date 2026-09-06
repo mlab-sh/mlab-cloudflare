@@ -37,7 +37,7 @@ pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
                 .iter()
                 .map(|(request, age, size, refused)| {
                     json!({
-                        "request": abbreviate(request),
+                        "request": crate::commands::abbreviate(request),
                         "age": ui::elapsed(Duration::from_secs(*age)),
                         "state": match (*age < ttl.as_secs(), refused) {
                             (false, _) => "stale",
@@ -75,25 +75,6 @@ pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
     Ok(())
 }
 
-/// Shorten the 32-character ids inside a request so the endpoint stays visible.
-///
-/// A cache row is only useful if you can see what was asked for, and a full
-/// zone id eats the width the path needs. Eight characters still tell two zones
-/// apart at a glance.
-fn abbreviate(request: &str) -> String {
-    request
-        .split('/')
-        .map(|seg| {
-            if seg.len() == 32 && seg.chars().all(|c| c.is_ascii_hexdigit()) {
-                format!("{}…", &seg[..8])
-            } else {
-                seg.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn plural(n: usize, noun: &str) -> String {
     if n == 1 {
         noun.to_string()
@@ -113,23 +94,6 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_id_is_shortened_and_the_endpoint_is_kept() {
-        assert_eq!(
-            abbreviate("LIST /zones/1a2b3c4d5e6f708192a3b4c5d6e7f809/dns_records"),
-            "LIST /zones/1a2b3c4d…/dns_records"
-        );
-    }
-
-    #[test]
-    fn a_path_segment_that_is_not_an_id_is_left_alone() {
-        assert_eq!(abbreviate("LIST /accounts"), "LIST /accounts");
-        assert_eq!(
-            abbreviate("GET /zones/example.com/dnssec"),
-            "GET /zones/example.com/dnssec"
-        );
-    }
 
     #[test]
     fn bytes_read_as_the_unit_they_belong_to() {

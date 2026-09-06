@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::cf::cache::{self, Cache, Hit, Refusal};
 use crate::cf::config::{Auth, Profile};
+use crate::cf::record::Recorder;
 
 /// Cap on a response body, so a misbehaving endpoint cannot exhaust memory.
 const MAX_RESPONSE_BYTES: usize = 64 << 20;
@@ -101,6 +102,9 @@ pub struct Client {
     cache: Option<Cache>,
     /// A fingerprint of the credential, so two profiles never share entries.
     tag: String,
+    /// Set by `snapshot` to keep what the API said. Sitting on the same path as
+    /// the cache is what makes it capture configuration and never liveness.
+    recorder: std::sync::OnceLock<std::sync::Arc<Recorder>>,
 }
 
 impl Client {
@@ -165,6 +169,7 @@ impl Client {
             auth: profile.auth,
             cache,
             tag,
+            recorder: std::sync::OnceLock::new(),
         })
     }
 
@@ -225,28 +230,53 @@ impl Client {
         Fut: std::future::Future<Output = Result<Value>>,
     {
         let Some(cache) = &self.cache else {
-            return fetch().await;
+            // Without a cache there is no shared path to record on, so the
+            // fetch is recorded here instead.
+            let got = fetch().await;
+            if let Some(r) = self.recorder.get() {
+                let label = format!("{label} {}", query_suffix(query));
+                match &got {
+                    Ok(v) => r.body(label.trim(), v),
+                    Err(e) => r.refusal(label.trim(), &one_line(e)),
+                }
+            }
+            return got;
         };
         // The query is part of what was asked for, so it is part of the key;
         // sorted, because two calls that differ only in argument order are the
         // same request.
-        let mut parts: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        parts.sort();
-        let request = format!("{label} {}", parts.join("&"));
+        let request = format!("{label} {}", query_suffix(query));
         let key = cache::key(&self.tag, &request);
 
+        // A recorded run wants what the API said for this request, whether the
+        // answer came from the cache or from the network.
+        let keep = |v: &Value| {
+            if let Some(r) = self.recorder.get() {
+                r.body(request.trim(), v);
+            }
+        };
+        let keep_refusal = |why: &str| {
+            if let Some(r) = self.recorder.get() {
+                r.refusal(request.trim(), why);
+            }
+        };
+
         match cache.get(&key) {
-            Some(Hit::Body(v)) => return Ok(v),
+            Some(Hit::Body(v)) => {
+                keep(&v);
+                return Ok(v);
+            }
             // Replayed with its own status and message, so a report says the
             // same thing it would have said after asking again.
             Some(Hit::Refused(r)) => {
+                keep_refusal(&format!("{} {}", r.status, r.message));
                 return Err(ApiError {
                     status: StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST),
                     code: r.code,
                     message: r.message,
                     retry_after: None,
                 }
-                .into())
+                .into());
             }
             None => {}
         }
@@ -254,9 +284,11 @@ impl Client {
         match fetch().await {
             Ok(fresh) => {
                 cache.put(&key, request.trim(), &fresh);
+                keep(&fresh);
                 Ok(fresh)
             }
             Err(e) => {
+                keep_refusal(&one_line(&e));
                 if let Some(api) = e.downcast_ref::<ApiError>() {
                     if worth_remembering(api) {
                         cache.put_refusal(
@@ -273,6 +305,11 @@ impl Client {
                 Err(e)
             }
         }
+    }
+
+    /// Keep every configuration read of this run. Called once, by `snapshot`.
+    pub fn record_into(&self, recorder: std::sync::Arc<Recorder>) {
+        let _ = self.recorder.set(recorder);
     }
 
     pub fn auth(&self) -> Auth {
@@ -487,6 +524,24 @@ impl Client {
         }
         Ok(out)
     }
+}
+
+/// The query part of a request key: sorted, because two calls that differ only
+/// in argument order are the same request.
+fn query_suffix(query: &[(String, String)]) -> String {
+    let mut parts: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    parts.sort();
+    parts.join("&")
+}
+
+/// The first line of an error, which is the one that names the cause.
+fn one_line(e: &anyhow::Error) -> String {
+    format!("{e:#}")
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Whether a refusal is the endpoint objecting to the page size we asked for.

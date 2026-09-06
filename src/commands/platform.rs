@@ -99,7 +99,7 @@ async fn gather(c: &Client, ctx: &Ctx, account: &str) -> Result<Platform> {
 
     let scripts = read_scripts(c, &base, scripts).await;
     let buckets = read_buckets(c, &base, buckets.unwrap_or_default()).await;
-    let routed = routed_scripts(c, ctx, account).await;
+    let routed = routed_scripts(c, ctx).await;
 
     Ok(Platform {
         subdomain,
@@ -216,26 +216,10 @@ async fn read_buckets(c: &Client, base: &str, listed: Vec<Value>) -> Vec<Bucket>
 /// One cached read per zone, usually already warm from `posture`. Without it a
 /// script on workers.dev cannot be told apart from one that is *only* there —
 /// and those are a bypass and a design respectively.
-async fn routed_scripts(c: &Client, ctx: &Ctx, account: &str) -> BTreeSet<String> {
-    let zones = if ctx.profile.zone.is_empty() {
-        c.cached_list(
-            "/zones",
-            &[("account.id".to_string(), account.to_string())],
-            None,
-        )
+async fn routed_scripts(c: &Client, ctx: &Ctx) -> BTreeSet<String> {
+    let zones = crate::commands::zones_in_scope(c, ctx)
         .await
-        .unwrap_or_default()
-    } else {
-        match scope::zone(c, &ctx.profile.zone).await {
-            Ok(id) => c
-                .cached(&format!("/zones/{}", esc(&id)), &[])
-                .await
-                .ok()
-                .into_iter()
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    };
+        .unwrap_or_default();
 
     let mut out = BTreeSet::new();
     for z in &zones {
@@ -441,4 +425,10 @@ fn observe(findings: Vec<Finding>) {
 
 fn str_of(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Read everything this plane needs, for a snapshot.
+pub(crate) async fn collect(c: &Client, ctx: &Ctx) -> Result<()> {
+    let account = scope::account(c, &ctx.profile.account).await?;
+    gather(c, ctx, &account).await.map(|_| ())
 }
