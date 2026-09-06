@@ -110,12 +110,22 @@ over fetched data) plus the two commands that use it.
   stronger than redacting it
 - An account without Zero Trust gets two lines, not a wall of findings
 
-## Phase 8 — egress, logging and alerting
+## Phase 8 — egress, logging and alerting — **done**
 
-Where request data goes and whether anyone is told when something breaks:
-Logpush destinations and their field lists, notification policies against the
-available alert types, silences never restored, webhook destinations failing
-since months, log retention and data residency.
+[`egress`](Egress) with `jobs` and `retention`, and [`alerts`](Egress) with
+`coverage`, `policies` and `destinations`.
+
+- Logpush jobs shipping headers, cookies or client addresses; disabled and
+  failing jobs; destinations shown as scheme and host only, since the rest of
+  the string carries an access key
+- Raw log retention per zone, stated as what it decides: whether a question
+  asked next month has an answer
+- Alert coverage grouped by **the question nobody answers** rather than by
+  identifier, gated on what the account can actually receive
+- Webhooks failing more recently than they succeeded, disabled policies,
+  standing silences
+- The plane most likely to be entirely unreadable, so it prints what it could
+  not read and says the plane is unaudited rather than clean
 
 ## Phase 9 — network
 

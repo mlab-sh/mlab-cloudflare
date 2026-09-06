@@ -127,6 +127,19 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// Where the request data goes, and whether any of it is kept
+    Egress {
+        #[command(subcommand)]
+        cmd: Option<commands::egress::EgressCmd>,
+    },
+
+    /// Whether anyone is told when something breaks
+    #[command(alias = "notifications")]
+    Alerts {
+        #[command(subcommand)]
+        cmd: Option<commands::egress::AlertsCmd>,
+    },
+
     /// Who reaches internal systems, and whether fleet traffic is inspected
     #[command(alias = "zt")]
     Zerotrust {
@@ -225,6 +238,8 @@ pub async fn run() -> Result<()> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Egress { cmd } => commands::egress::run_egress(&c, &ctx, cmd).await,
+        Cmd::Alerts { cmd } => commands::egress::run_alerts(&c, &ctx, cmd).await,
         Cmd::Zerotrust { cmd } => commands::zerotrust::run(&c, &ctx, cmd).await,
         Cmd::Platform { cmd } => commands::platform::run(&c, &ctx, cmd).await,
         Cmd::Tls { cmd } => commands::tls::run(&c, &ctx, cmd).await,

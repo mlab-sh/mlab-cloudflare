@@ -9,6 +9,7 @@ pub mod activity;
 pub mod api;
 pub mod cache;
 pub mod dns;
+pub mod egress;
 pub mod identity;
 pub mod login;
 pub mod ping;

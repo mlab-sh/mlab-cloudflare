@@ -26,6 +26,8 @@ unless a command says it does and you pass the flag that allows it.
 | [`tls`](Tls) | What browsers are served, and whether the origin will talk to anyone. Graded. |
 | [`platform`](Platform) | What developers provisioned, and what it is reachable on. Graded. |
 | [`zerotrust`](Zerotrust) | Who reaches internal systems, and is fleet traffic inspected. Graded. |
+| [`egress`](Egress) | Where the request data goes, and whether any of it is kept. Graded. |
+| [`alerts`](Egress) | Whether anyone is told when something breaks. Graded. |
 | [`identity`](Identity) | Who can change this account, and with what. Graded. |
 | [`activity`](Activity) | What was actually done to this account, and by whom. |
 | [`api`](Api) | Raw request against any endpoint, for everything not wrapped yet. |

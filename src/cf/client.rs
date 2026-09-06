@@ -498,7 +498,13 @@ fn rejects_paging(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<ApiError>(),
         Some(a) if a.status == StatusCode::BAD_REQUEST
-            && a.message.to_ascii_lowercase().contains("list options")
+            && {
+                let m = a.message.to_ascii_lowercase();
+                // Two wordings for the same objection: "Invalid list options
+                // provided" from Pages, "per_page (3) must be a multiple of 5"
+                // from the alert history.
+                m.contains("list options") || m.contains("per_page")
+            }
     )
 }
 
@@ -775,6 +781,13 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "Invalid list options provided. Review the documentation."
         )));
+        assert!(
+            rejects_paging(&err(
+                StatusCode::BAD_REQUEST,
+                "per_page (3) must be a multiple of 5"
+            )),
+            "the same objection, worded differently"
+        );
         assert!(
             !rejects_paging(&err(
                 StatusCode::BAD_REQUEST,

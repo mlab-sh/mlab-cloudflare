@@ -10,6 +10,8 @@
 - [tls](Tls)
 - [platform](Platform)
 - [zerotrust](Zerotrust)
+- [egress](Egress)
+- [alerts](Egress)
 - [identity](Identity)
 - [activity](Activity)
 - [login](Login)

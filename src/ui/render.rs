@@ -260,6 +260,40 @@ pub const ROUTE_COLS: &[Col] = &[
     Col("VIRTUAL NETWORK", &["vnet"]),
 ];
 
+pub const LOGPUSH_COLS: &[Col] = &[
+    Col("SCOPE", &["scope"]),
+    Col("NAME", &["name"]),
+    Col("DATASET", &["dataset"]),
+    Col("DESTINATION", &["destination"]),
+    Col("ON", &["on"]),
+    Col("LAST ERROR", &["error"]),
+];
+
+pub const RETENTION_COLS: &[Col] = &[Col("ZONE", &["zone"]), Col("RETENTION", &["retention"])];
+
+pub const ALERT_POLICY_COLS: &[Col] = &[
+    Col("POLICY", &["policy"]),
+    Col("ALERT", &["alert"]),
+    Col("ON", &["on"]),
+    Col("VIA", &["via"]),
+];
+
+/// Every alert type the account can receive, and whether anything listens.
+pub const COVERAGE_COLS: &[Col] = &[
+    Col("ALERT", &["alert"]),
+    Col("TYPE", &["type"]),
+    Col("POLICY", &["policy"]),
+];
+
+pub const DESTINATION_COLS: &[Col] = &[
+    Col("KIND", &["kind"]),
+    Col("NAME", &["name"]),
+    Col("LAST SUCCESS", &["lastSuccess"]),
+    Col("LAST FAILURE", &["lastFailure"]),
+];
+
+pub const UNREAD_EGRESS_COLS: &[Col] = &[Col("ENDPOINT", &["path"]), Col("WHY", &["reason"])];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),

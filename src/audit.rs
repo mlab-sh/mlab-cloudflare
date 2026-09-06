@@ -3360,6 +3360,385 @@ fn prefix_len(cidr: &str) -> Option<u8> {
     cidr.split_once('/')?.1.parse().ok()
 }
 
+// ---- egress, logging and alerting ------------------------------------------
+
+/// Where request data goes, and whether any of it is kept.
+pub struct Egress {
+    /// Account-level and zone-level Logpush jobs, each tagged with its scope.
+    pub jobs: Vec<(String, Value)>,
+    /// `None` when the read was refused, which is the common case: Logpush
+    /// needs its own permission.
+    pub jobs_readable: bool,
+    pub residency: Option<Value>,
+    /// Zone name to whether raw log retention is on. Absent zones were unread.
+    pub retention: Vec<(String, bool)>,
+    /// Reads that were refused, as (what, why).
+    ///
+    /// This plane is the one most likely to be entirely unreadable — Logpush
+    /// and log control each need their own permission — so an empty findings
+    /// list here means "nothing was looked at" far more often than it means
+    /// "nothing is wrong". Carrying the refusals is what stops the report
+    /// saying the second when it means the first.
+    pub unread: Vec<(String, String)>,
+}
+
+/// Whether anyone is told when something breaks.
+pub struct Alerting {
+    pub policies: Vec<Value>,
+    /// Alert type to display name, for every type this account can receive.
+    pub available: Vec<(String, String)>,
+    pub webhooks: Vec<Value>,
+    pub pagerduty: Vec<Value>,
+    pub silences: Vec<Value>,
+    pub history: Vec<Value>,
+}
+
+/// The field names that carry something about a person rather than a request.
+const SENSITIVE_FIELDS: [&str; 8] = [
+    "ClientRequestCookies",
+    "ClientRequestHeaders",
+    "ClientRequestUserAgent",
+    "ClientIP",
+    "ClientDeviceType",
+    "RequestHeaders",
+    "ResponseHeaders",
+    "Cookies",
+];
+
+/// Checks over where the request data goes.
+pub fn egress(e: &Egress) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut disabled = Vec::new();
+    let mut failing = Vec::new();
+    let mut sensitive = Vec::new();
+    let mut destinations = Vec::new();
+
+    for (scope, j) in &e.jobs {
+        let name = match str_of(j, "name") {
+            n if n.is_empty() => str_of(j, "dataset"),
+            n => n,
+        };
+        let label = format!("{scope}/{name}");
+        let dest = destination_of(&str_of(j, "destination_conf"));
+
+        if j.get("enabled").and_then(Value::as_bool) == Some(false) {
+            disabled.push(label.clone());
+        }
+        if !str_of(j, "last_error").is_empty() {
+            failing.push(format!("{label}: {}", str_of(j, "last_error")));
+        }
+        destinations.push(format!("{label} → {dest} ({})", str_of(j, "dataset")));
+
+        let fields: Vec<String> = j
+            .get("output_options")
+            .and_then(|o| o.get("field_names"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|f| SENSITIVE_FIELDS.contains(f))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !fields.is_empty() {
+            sensitive.push(format!("{label} → {dest}: {}", fields.join(", ")));
+        }
+    }
+
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "egress", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::Medium,
+        format!(
+            "{} Logpush {} headers, cookies or client addresses to an external \
+             destination",
+            sensitive.len(),
+            agree(sensitive.len(), "job ships", "jobs ship")
+        ),
+        sensitive.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} Logpush {} disabled, so the logs everyone assumes exist are not being \
+             written",
+            disabled.len(),
+            agree(disabled.len(), "job is", "jobs are")
+        ),
+        disabled.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} Logpush {} failing",
+            failing.len(),
+            agree(failing.len(), "job is", "jobs are")
+        ),
+        failing.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} Logpush {} data off this account",
+            destinations.len(),
+            agree(destinations.len(), "job sends", "jobs send")
+        ),
+        destinations.clone(),
+    );
+
+    // Retention decides whether a question asked next month has an answer, and
+    // turning it on today does not answer it retroactively.
+    let off: Vec<String> = e
+        .retention
+        .iter()
+        .filter(|(_, on)| !on)
+        .map(|(z, _)| z.clone())
+        .collect();
+    if !off.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "egress",
+                format!(
+                    "{} {} raw log retention off, so there is no record to answer a question \
+                     asked later — and switching it on does not answer one asked about today",
+                    off.len(),
+                    agree(off.len(), "zone has", "zones have")
+                ),
+            )
+            .with(off.join(", ")),
+        );
+    }
+
+    if e.jobs_readable && e.jobs.is_empty() {
+        out.push(Finding::new(
+            Severity::Info,
+            "egress",
+            "no Logpush job: request data leaves this account through nothing configured here",
+        ));
+    }
+    out
+}
+
+/// The service a Logpush destination points at, without its credentials.
+///
+/// A destination string carries the bucket and, for some backends, an access
+/// key in its query. Only the scheme and host are ever shown.
+pub fn destination_of(conf: &str) -> String {
+    let scheme = conf.split("://").next().unwrap_or("");
+    let rest = conf.split("://").nth(1).unwrap_or("");
+    let host = rest.split(['?', '/']).next().unwrap_or("");
+    match (scheme, host) {
+        ("", _) => "(unreadable)".to_string(),
+        (s, "") => s.to_string(),
+        (s, h) => format!("{s}://{h}"),
+    }
+}
+
+/// Alert types worth having, grouped by the question each one answers.
+///
+/// Grouped rather than listed because "55 of 57 alert types have no policy" is
+/// a number nobody acts on, while "nothing tells you a certificate stopped
+/// renewing" is a sentence with a next step. Each group fires only when the
+/// account can receive at least one of its types and subscribes to none.
+const WATCHED: &[(&str, &[&str], Severity)] = &[
+    (
+        "a certificate expires or stops renewing",
+        &[
+            "universal_ssl_event_type",
+            "dedicated_ssl_certificate_event_type",
+            "custom_ssl_certificate_event_type",
+            "access_custom_certificate_expiration_type",
+            "mtls_certificate_store_certificate_expiration_type",
+            "zone_aop_custom_certificate_expiration_type",
+            "hostname_aop_custom_certificate_expiration_type",
+        ],
+        Severity::Medium,
+    ),
+    (
+        "a Logpush job is disabled for failing, and the logs quietly stop",
+        &["failing_logpush_job_disabled_alert"],
+        Severity::Medium,
+    ),
+    (
+        "an Access service token is about to expire",
+        &["expiring_service_token_alert"],
+        Severity::Medium,
+    ),
+    (
+        "a route to these prefixes is leaked or hijacked",
+        &["bgp_hijack_notification"],
+        Severity::Low,
+    ),
+    (
+        "the site is under a layer 7 attack",
+        &["dos_attack_l7"],
+        Severity::Low,
+    ),
+    (
+        "the origin stops answering",
+        &[
+            "real_origin_monitoring",
+            "health_check_status_notification",
+            "load_balancing_health_alert",
+            "tunnel_health_event",
+        ],
+        Severity::Low,
+    ),
+    (
+        "usage runs away and the bill with it",
+        &["billing_usage_alert", "billing_budget_alert"],
+        Severity::Low,
+    ),
+    (
+        "Page Shield sees a malicious script or domain",
+        &[
+            "scriptmonitor_alert_new_malicious_scripts",
+            "scriptmonitor_alert_new_malicious_hosts",
+            "scriptmonitor_alert_new_malicious_url",
+        ],
+        Severity::Low,
+    ),
+];
+
+/// Checks over whether anyone is told.
+pub fn alerting(a: &Alerting) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    let subscribed: BTreeSet<String> = a
+        .policies
+        .iter()
+        .filter(|p| p.get("enabled").and_then(Value::as_bool) != Some(false))
+        .map(|p| str_of(p, "alert_type"))
+        .collect();
+    let available: BTreeSet<String> = a.available.iter().map(|(t, _)| t.clone()).collect();
+
+    // Only groups this account could actually receive, so a plan gap is never
+    // reported as a gap in configuration.
+    let mut uncovered: Vec<(&str, Severity)> = Vec::new();
+    for (question, types, sev) in WATCHED {
+        let offered = types.iter().any(|t| available.contains(*t));
+        let taken = types.iter().any(|t| subscribed.contains(*t));
+        if offered && !taken {
+            uncovered.push((question, *sev));
+        }
+    }
+    for sev in [Severity::Medium, Severity::Low] {
+        let questions: Vec<String> = uncovered
+            .iter()
+            .filter(|(_, s)| *s == sev)
+            .map(|(q, _)| (*q).to_string())
+            .collect();
+        if !questions.is_empty() {
+            out.push(
+                Finding::new(
+                    sev,
+                    "alerts",
+                    format!(
+                        "nothing tells anyone when {} {}",
+                        questions.len(),
+                        agree(questions.len(), "of these happens", "of these happen")
+                    ),
+                )
+                .with(questions.join("; ")),
+            );
+        }
+    }
+
+    let off: Vec<String> = a
+        .policies
+        .iter()
+        .filter(|p| p.get("enabled").and_then(Value::as_bool) == Some(false))
+        .map(|p| str_of(p, "name"))
+        .collect();
+    if !off.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "alerts",
+                format!(
+                    "{} notification {} disabled",
+                    off.len(),
+                    agree(off.len(), "policy is", "policies are")
+                ),
+            )
+            .with(off.join(", ")),
+        );
+    }
+
+    // A webhook whose last failure is newer than its last success has been
+    // delivering nothing, and every policy pointing at it is silent.
+    let broken: Vec<String> = a
+        .webhooks
+        .iter()
+        .filter(|w| {
+            let (ok, bad) = (str_of(w, "last_success"), str_of(w, "last_failure"));
+            !bad.is_empty() && (ok.is_empty() || bad > ok)
+        })
+        .map(|w| {
+            format!(
+                "{} (last failure {})",
+                str_of(w, "name"),
+                str_of(w, "last_failure")
+            )
+        })
+        .collect();
+    if !broken.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "alerts",
+                format!(
+                    "{} webhook {} failing more recently than {} succeeded, so every policy \
+                     pointing at {} is silent",
+                    broken.len(),
+                    agree(broken.len(), "destination is", "destinations are"),
+                    agree(broken.len(), "it", "they"),
+                    agree(broken.len(), "it", "them")
+                ),
+            )
+            .with(broken.join(", ")),
+        );
+    }
+
+    // A silence is created to stop noise during an incident and is meant to be
+    // temporary.
+    if !a.silences.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "alerts",
+                format!(
+                    "{} alert {} silenced",
+                    a.silences.len(),
+                    agree(a.silences.len(), "is", "are")
+                ),
+            )
+            .with(
+                a.silences
+                    .iter()
+                    .map(|s| str_of(s, "description"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+    }
+
+    if a.policies.is_empty() && !a.available.is_empty() {
+        out.push(Finding::new(
+            Severity::Medium,
+            "alerts",
+            "no notification policy at all: nothing on this account tells anyone anything",
+        ));
+    }
+    out
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -5068,6 +5447,187 @@ mod tests {
             .unwrap();
         assert!(hit.detail.contains("10.0.0.0/8"));
         assert!(!hit.detail.contains("10.4.2.0/24"));
+    }
+
+    // ---- egress, logging and alerting -----------------------------------------
+
+    fn egress_of(jobs: Vec<(&str, Value)>) -> Egress {
+        Egress {
+            jobs: jobs.into_iter().map(|(s, j)| (s.to_string(), j)).collect(),
+            jobs_readable: true,
+            residency: None,
+            retention: vec![],
+            unread: vec![],
+        }
+    }
+
+    #[test]
+    fn a_destination_is_shown_without_whatever_follows_it() {
+        // The rest of the string carries an access key for some backends.
+        assert_eq!(
+            destination_of(
+                "s3://logs-bucket/cf?region=eu-west-1&access-key-id=AKIA&secret-access-key=x"
+            ),
+            "s3://logs-bucket"
+        );
+        assert_eq!(
+            destination_of("datadog://http-intake.logs.datadoghq.com?header_DD-API-KEY=k"),
+            "datadog://http-intake.logs.datadoghq.com"
+        );
+        assert_eq!(destination_of(""), "(unreadable)");
+    }
+
+    #[test]
+    fn a_job_shipping_headers_or_cookies_is_named_with_the_fields() {
+        let e = egress_of(vec![(
+            "example.com",
+            json!({
+                "name": "http", "dataset": "http_requests", "enabled": true,
+                "destination_conf": "s3://vendor-bucket/cf?region=us",
+                "output_options": {"field_names": ["RayID", "ClientRequestCookies", "ClientIP"]}
+            }),
+        )]);
+        let f = egress(&e);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("headers, cookies"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert!(hit.detail.contains("ClientRequestCookies"));
+        assert!(hit.detail.contains("s3://vendor-bucket"));
+        assert!(
+            !hit.detail.contains("RayID"),
+            "an ordinary field is not the point"
+        );
+        assert!(
+            !hit.detail.contains("region=us"),
+            "and the query never appears"
+        );
+    }
+
+    #[test]
+    fn a_disabled_job_is_the_logs_everyone_assumes_exist() {
+        let e = egress_of(vec![(
+            "account",
+            json!({"name": "audit", "dataset": "audit_logs", "enabled": false,
+                   "destination_conf": "r2://logs"}),
+        )]);
+        assert_eq!(at(&egress(&e), "disabled, so the logs"), Severity::Medium);
+    }
+
+    #[test]
+    fn retention_is_only_judged_for_zones_whose_flag_was_read() {
+        let mut e = egress_of(vec![]);
+        e.retention = vec![("on.test".into(), true), ("off.test".into(), false)];
+        let f = egress(&e);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("retention off"))
+            .unwrap();
+        assert_eq!(hit.detail, "off.test");
+
+        // No flags read at all: no claim either way.
+        let mut none = egress_of(vec![]);
+        none.jobs_readable = false;
+        assert!(!has(&egress(&none), "retention off"));
+    }
+
+    fn alerting_of(policies: Value, available: &[&str]) -> Alerting {
+        Alerting {
+            policies: policies.as_array().cloned().unwrap_or_default(),
+            available: available
+                .iter()
+                .map(|t| ((*t).to_string(), (*t).to_string()))
+                .collect(),
+            webhooks: vec![],
+            pagerduty: vec![],
+            silences: vec![],
+            history: vec![],
+        }
+    }
+
+    #[test]
+    fn coverage_is_reported_as_the_question_nobody_answers() {
+        // Not "55 of 57 types have no policy", which is a number nobody acts
+        // on, but the sentence that has a next step.
+        let a = alerting_of(json!([]), &["universal_ssl_event_type", "dos_attack_l7"]);
+        let f = alerting(&a);
+        let hit = f
+            .iter()
+            .find(|f| f.detail.contains("a certificate expires"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert!(f.iter().any(|f| f.detail.contains("layer 7 attack")));
+    }
+
+    #[test]
+    fn a_group_the_account_cannot_receive_is_not_a_gap_in_configuration() {
+        // `available_alerts` already reflects the plan, so a type that is not
+        // offered is a price list rather than a missing policy.
+        let a = alerting_of(json!([]), &["dos_attack_l7"]);
+        let f = alerting(&a);
+        assert!(
+            !f.iter().any(|f| f.detail.contains("a certificate expires")),
+            "no certificate alert type is offered here"
+        );
+    }
+
+    #[test]
+    fn one_subscription_covers_its_whole_group() {
+        // The question is answered, whichever of its alert types answers it.
+        let a = alerting_of(
+            json!([{"name": "ssl", "alert_type": "universal_ssl_event_type", "enabled": true}]),
+            &[
+                "universal_ssl_event_type",
+                "dedicated_ssl_certificate_event_type",
+            ],
+        );
+        assert!(!alerting(&a)
+            .iter()
+            .any(|f| f.detail.contains("a certificate expires")));
+    }
+
+    #[test]
+    fn a_disabled_policy_does_not_count_as_coverage() {
+        let a = alerting_of(
+            json!([{"name": "ssl", "alert_type": "universal_ssl_event_type", "enabled": false}]),
+            &["universal_ssl_event_type"],
+        );
+        let f = alerting(&a);
+        assert!(f.iter().any(|f| f.detail.contains("a certificate expires")));
+        assert_eq!(at(&f, "notification policy is disabled"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_webhook_failing_more_recently_than_it_succeeded_is_silent() {
+        let mut a = alerting_of(json!([]), &[]);
+        a.webhooks = vec![
+            json!({"name": "slack", "last_success": "2026-01-01T00:00:00Z",
+                   "last_failure": "2026-09-01T00:00:00Z"}),
+            json!({"name": "ops", "last_success": "2026-09-02T00:00:00Z",
+                   "last_failure": "2026-01-01T00:00:00Z"}),
+            json!({"name": "fresh"}),
+        ];
+        let f = alerting(&a);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("failing more recently"))
+            .unwrap();
+        assert!(hit.detail.contains("slack"));
+        assert!(!hit.detail.contains("ops"), "it recovered");
+        assert!(!hit.detail.contains("fresh"), "it has never failed");
+    }
+
+    #[test]
+    fn no_policy_at_all_is_said_plainly() {
+        let a = alerting_of(json!([]), &["dos_attack_l7"]);
+        assert_eq!(
+            at(&alerting(&a), "no notification policy at all"),
+            Severity::Medium
+        );
+
+        // An account that cannot receive anything gets no finding.
+        assert!(alerting(&alerting_of(json!([]), &[])).is_empty());
     }
 
     // ---- ordering -----------------------------------------------------------
