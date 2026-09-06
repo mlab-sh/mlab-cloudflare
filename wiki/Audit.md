@@ -118,3 +118,28 @@ runs cold every time unless the cache directory is preserved between jobs.
 
 - [Snapshot](Snapshot) — the same reads, kept rather than judged
 - [Errors](Errors) — why a refusal has more than one meaning
+
+## `--enrich`
+
+Folds in the outside view that [`enrich`](Enrich) collects: shadow hostnames,
+public certificates, live mail policy, and what the origin addresses really are.
+
+```bash
+mlab-cloudflare audit --enrich
+mlab-cloudflare audit --enrich --fail-on high
+```
+
+It reads **only results `enrich` has already fetched** and never spends mlab
+quota. Targets with no held result are counted in the summary:
+
+```
+  not read               8
+  not looked up outside  2
+
+  › 2 targets have no held mlab result; `enrich` looks them up
+```
+
+That is the same rule as **Not read**, for the same reason: a target the outside
+view never covered must not read as a target it found nothing on. A command that
+silently drew down a daily limit as a side effect of running the ordinary report
+would be a bad surprise exactly once, and it would be the run that mattered.

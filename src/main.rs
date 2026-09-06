@@ -6,6 +6,7 @@
 //! | module     | role                                                        |
 //! | ---------- | ----------------------------------------------------------- |
 //! | `cf`       | the API: HTTP handler, profiles, account and zone resolution |
+//! | `mlab`     | the mlab.sh API, for what Cloudflare cannot see from inside  |
 //! | `audit`    | the graded checks, as pure functions over fetched data       |
 //! | `ui`       | everything the user sees: progress on stderr, rendering      |
 //! | `cli`      | the clap surface and the dispatch                            |
@@ -15,6 +16,7 @@ mod audit;
 mod cf;
 mod cli;
 mod commands;
+mod mlab;
 mod providers;
 mod ui;
 

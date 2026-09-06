@@ -641,6 +641,46 @@ pub fn published_origins(records: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Every public address the zone publishes, with the records that publish it
+/// and whether Cloudflare also proxies for it.
+///
+/// [`published_origins`] answers the narrower question the DNS plane asks — an
+/// origin published *around* the proxy — and formats its answer for a report.
+/// This returns the addresses themselves, because the enrichment plane has to
+/// look each one up and can only afford to do that once per address.
+pub fn public_addresses(records: &[Value]) -> Vec<(String, Vec<String>, bool)> {
+    let proxied = proxied_origins(records);
+    let mut by_addr: BTreeMap<String, (Vec<String>, bool)> = BTreeMap::new();
+
+    for r in records {
+        if !matches!(str_of(r, "type").as_str(), "A" | "AAAA") {
+            continue;
+        }
+        let addr = str_of(r, "content");
+        // A placeholder is deliberate filler and a private address is
+        // unreachable; neither is worth a lookup, and looking one up would
+        // spend somebody's quota to learn nothing.
+        if addr.is_empty() || is_placeholder(&addr) || is_private(&addr) {
+            continue;
+        }
+        let unproxied = r.get("proxied").and_then(Value::as_bool) != Some(true);
+        let entry = by_addr.entry(addr.clone()).or_default();
+        entry.0.push(str_of(r, "name"));
+        // Exposed means: reachable without going through the proxy, while the
+        // proxy is fronting for it. One such record is enough.
+        entry.1 |= unproxied && proxied.contains(&addr);
+    }
+
+    by_addr
+        .into_iter()
+        .map(|(addr, (mut names, exposed))| {
+            names.sort();
+            names.dedup();
+            (addr, names, exposed)
+        })
+        .collect()
+}
+
 /// A record that resolves to nothing on purpose.
 ///
 /// `100::` is the IPv6 discard prefix and `192.0.2.0/24` is documentation
@@ -4133,6 +4173,743 @@ fn empty_list(v: &Value, key: &str) -> bool {
         .unwrap_or(true)
 }
 
+// ---- the outside view ------------------------------------------------------
+
+/// One zone, as Cloudflare holds it and as mlab.sh observed it.
+///
+/// Every other plane in this tool reads the account's own record of itself.
+/// This one is the only place where a second, independent observer is put
+/// beside that record, and the findings below are all of one kind: **the two
+/// disagree**. A name Cloudflare does not know but the world resolves is not a
+/// misconfiguration in the Cloudflare account — it is proof that the Cloudflare
+/// account is not the whole story.
+pub struct Outside {
+    pub zone: String,
+    /// Every hostname the zone holds a record for, lowercased, trailing dot
+    /// removed. Built from the records rather than from the scan, so a name
+    /// missing here really is missing from Cloudflare.
+    pub known: BTreeSet<String>,
+    /// Whether the Cloudflare zone itself publishes SPF, and DMARC.
+    pub cf_spf: bool,
+    pub cf_dmarc: bool,
+    /// `results` from a completed domain scan.
+    pub scan: Value,
+}
+
+/// One published address, as Cloudflare configures it and as mlab.sh sees it.
+pub struct Address {
+    /// The record names pointing here, for the detail line.
+    pub names: Vec<String>,
+    pub addr: String,
+    /// Whether Cloudflare also proxies for this address. A proxied-for address
+    /// published in a second, unproxied record is the classic bypass; an
+    /// address that is only ever an origin behind the proxy is not exposed by
+    /// being an origin.
+    pub exposed: bool,
+    /// The `scan_ip` body.
+    pub scan: Value,
+}
+
+impl Address {
+    fn label(&self) -> String {
+        if self.names.is_empty() {
+            self.addr.clone()
+        } else {
+            format!("{} → {}", self.names.join(", "), self.addr)
+        }
+    }
+}
+
+/// Names the world resolves that the Cloudflare zone has no record for.
+///
+/// The highest-value check in the tool, and the one no amount of reading the
+/// Cloudflare API can produce: a subdomain that answers but is not in the zone
+/// is served by nameservers, a delegation, or a wildcard that this account does
+/// not control, and nothing in the account will ever mention it.
+pub fn shadow(zones: &[Outside]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut answering = Vec::new();
+    let mut observed = Vec::new();
+    let mut in_ct = Vec::new();
+    let mut flagged = Vec::new();
+
+    for z in zones {
+        let results = scan_results(&z.scan);
+        // Names the scan got an answer for. This is a positive result and is
+        // used only as one: `dns.resolve` does not cover every discovered name
+        // — two names that plainly answer were missing from it on a real scan
+        // — so absence from it means "not shown to resolve", never "does not
+        // resolve", and nothing here concludes the latter.
+        let resolved = resolving(scan_dns(&z.scan));
+
+        for host in list(results, "subdomains").iter().filter_map(Value::as_str) {
+            let host = normalise(host);
+            if z.known.contains(&host) {
+                continue;
+            }
+            if resolved.contains(&host) {
+                answering.push(host);
+            } else {
+                observed.push(host);
+            }
+        }
+
+        // Certificate transparency: somebody proved control of the name to a
+        // CA. A wildcard covers a label, so it is judged as the name it wraps.
+        for cert in list(results, "ssl") {
+            let cn = str_of(cert, "common_name");
+            let host = normalise(cn.strip_prefix("*.").unwrap_or(&cn));
+            // Cloudflare issues universal certificates under a hashed name of
+            // its own; those belong to Cloudflare, not to the zone.
+            if host.is_empty() || host.ends_with(".sni.cloudflaressl.com") {
+                continue;
+            }
+            if in_zone(&host, &z.zone) && !z.known.contains(&host) {
+                in_ct.push(host);
+            }
+        }
+
+        for s in list(results, "subdomains_suspicious") {
+            flagged.push(format!(
+                "{} (\"{}\")",
+                str_of(s, "subdomain"),
+                str_of(s, "keyword")
+            ));
+        }
+    }
+
+    for v in [&mut answering, &mut observed, &mut in_ct, &mut flagged] {
+        v.sort();
+        v.dedup();
+    }
+    // Each name is reported once, under the strongest evidence there is for it.
+    observed.retain(|h| !answering.contains(h));
+    in_ct.retain(|h| !answering.contains(h) && !observed.contains(h));
+
+    if !answering.is_empty() {
+        let n = answering.len();
+        out.push(
+            Finding::new(
+                Severity::High,
+                "shadow",
+                format!(
+                    "{n} {} and the Cloudflare zone holds no record for {}",
+                    agree(n, "hostname resolves", "hostnames resolve"),
+                    agree(n, "it", "them")
+                ),
+            )
+            .with(answering.join(", ")),
+        );
+    }
+    if !observed.is_empty() {
+        let n = observed.len();
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "shadow",
+                format!(
+                    "{n} {} publicly and {} in the Cloudflare zone",
+                    agree(n, "hostname is known", "hostnames are known"),
+                    agree(n, "has no record", "have no record")
+                ),
+            )
+            .with(observed.join(", ")),
+        );
+    }
+    if !in_ct.is_empty() {
+        let n = in_ct.len();
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "shadow",
+                format!(
+                    "{n} {} a public certificate and no record in the zone",
+                    agree(n, "hostname has", "hostnames have")
+                ),
+            )
+            .with(in_ct.join(", ")),
+        );
+    }
+    if !flagged.is_empty() {
+        let n = flagged.len();
+        out.push(
+            Finding::new(
+                Severity::Low,
+                "shadow",
+                format!(
+                    "{n} public {} name an internal environment",
+                    agree(n, "hostname", "hostnames")
+                ),
+            )
+            .with(flagged.join(", ")),
+        );
+    }
+    out
+}
+
+/// The hostnames a scan actually got an answer for.
+///
+/// `dns.resolve` holds the apex plus every discovered name that answered; a
+/// discovered name missing from it did not answer. Nothing else in the scan
+/// carries that distinction, and the whole of [`shadow`] turns on it.
+fn resolving(dns: &Value) -> BTreeSet<String> {
+    list(dns, "resolve")
+        .iter()
+        .filter(|r| {
+            !list(r, "a").is_empty()
+                || !list(r, "aaaa").is_empty()
+                || !str_of(r, "cname").is_empty()
+        })
+        .map(|r| normalise(&str_of(r, "domain")))
+        .collect()
+}
+
+/// What the world resolves, against what Cloudflare is configured to serve.
+pub fn drift(zones: &[Outside]) -> Vec<Finding> {
+    let mut unproxied = Vec::new();
+
+    for z in zones {
+        for r in list(scan_dns(&z.scan), "resolve") {
+            let host = normalise(&str_of(r, "domain"));
+            let a: Vec<String> = list(r, "a")
+                .iter()
+                .chain(list(r, "aaaa"))
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
+
+            // Cloudflare's own space is what a proxied name answers with.
+            // Anything else is the origin answering directly, to anyone who
+            // asks, which is the exposure the proxy exists to prevent.
+            if !a.is_empty() && !a.iter().any(|ip| is_cloudflare(ip)) {
+                unproxied.push(format!("{host} → {}", a.join(", ")));
+            }
+        }
+    }
+    unproxied.sort();
+    unproxied.dedup();
+
+    if unproxied.is_empty() {
+        return Vec::new();
+    }
+    let n = unproxied.len();
+    vec![Finding::new(
+        Severity::Medium,
+        "drift",
+        format!(
+            "{n} public {} an address outside Cloudflare, so the proxy is not in the path",
+            agree(n, "hostname resolves to", "hostnames resolve to")
+        ),
+    )
+    .with(unproxied.join(", "))]
+}
+
+/// The live mail policy, against the one the Cloudflare zone publishes.
+///
+/// The DNS plane already reports a zone with no SPF or no DMARC. This check
+/// answers a question that plane cannot: whether what is *in the zone* is what
+/// the world actually gets. A record present in Cloudflare and absent live means
+/// the zone is not authoritative; a record absent in Cloudflare and present live
+/// means the same thing from the other direction, and is the more alarming of
+/// the two.
+pub fn live_mail(zones: &[Outside]) -> Vec<Finding> {
+    let mut out = Vec::new();
+    let mut served_elsewhere = Vec::new();
+    let mut not_live = Vec::new();
+    let mut monitor_only = Vec::new();
+    let mut permissive = Vec::new();
+
+    for z in zones {
+        let txt = scan_dns(&z.scan).get("txt").cloned().unwrap_or(json!({}));
+        let spf = str_of(&txt, "spf");
+        let dmarc = str_of(&txt, "dmarc");
+
+        for (what, in_cf, live) in [
+            ("SPF", z.cf_spf, !spf.is_empty()),
+            ("DMARC", z.cf_dmarc, !dmarc.is_empty()),
+        ] {
+            match (in_cf, live) {
+                (false, true) => served_elsewhere.push(format!("{} ({what})", z.zone)),
+                (true, false) => not_live.push(format!("{} ({what})", z.zone)),
+                _ => {}
+            }
+        }
+
+        // `p=none` collects reports and rejects nothing, which is a deployment
+        // step rather than a policy.
+        if policy_of(&dmarc).as_deref() == Some("none") {
+            monitor_only.push(z.zone.clone());
+        }
+        // `+all` authorises every host on the internet; `?all` asserts nothing.
+        if spf.contains("+all") || spf.contains("?all") {
+            permissive.push(format!("{}: {spf}", z.zone));
+        }
+    }
+
+    if !served_elsewhere.is_empty() {
+        let n = served_elsewhere.len();
+        out.push(
+            Finding::new(
+                Severity::High,
+                "live mail",
+                format!(
+                    "{n} mail {} live and absent from the Cloudflare zone, so something else answers for the {}",
+                    agree(n, "policy is", "policies are"),
+                    agree(n, "name", "names")
+                ),
+            )
+            .with(served_elsewhere.join(", ")),
+        );
+    }
+    if !not_live.is_empty() {
+        let n = not_live.len();
+        out.push(
+            Finding::new(
+                Severity::High,
+                "live mail",
+                format!(
+                    "{n} mail {} in the Cloudflare zone and {} resolve, so {} nothing",
+                    agree(n, "policy is", "policies are"),
+                    agree(n, "does not", "do not"),
+                    agree(n, "it enforces", "they enforce")
+                ),
+            )
+            .with(not_live.join(", ")),
+        );
+    }
+    if !monitor_only.is_empty() {
+        let n = monitor_only.len();
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "live mail",
+                format!(
+                    "{n} live DMARC {} p=none, which reports and rejects nothing",
+                    agree(n, "policy is", "policies are")
+                ),
+            )
+            .with(monitor_only.join(", ")),
+        );
+    }
+    if !permissive.is_empty() {
+        let n = permissive.len();
+        out.push(
+            Finding::new(
+                Severity::High,
+                "live mail",
+                format!(
+                    "{n} live SPF {} every sender",
+                    agree(n, "record authorises", "records authorise")
+                ),
+            )
+            .with(permissive.join(", ")),
+        );
+    }
+    out
+}
+
+/// Certificates in the public logs for these zones.
+///
+/// The certificate plane reads what Cloudflare issued. This reads what any CA
+/// issued, which is the only way to see a certificate somebody obtained for
+/// this name outside the account.
+pub fn public_certs(zones: &[Outside], soon_days: i64) -> Vec<Finding> {
+    let mut issuers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // The newest certificate for each name, by expiry. A transparency log holds
+    // every certificate ever issued, so most entries for a live name are
+    // already superseded; reporting those as expiring produced six findings on
+    // a zone that had none.
+    let mut newest: BTreeMap<String, (i64, String)> = BTreeMap::new();
+
+    for z in zones {
+        for cert in list(scan_results(&z.scan), "ssl") {
+            let cn = str_of(cert, "common_name");
+            if cn.is_empty() || cn.ends_with(".sni.cloudflaressl.com") {
+                continue;
+            }
+            let issuer = issuer_name(&str_of(cert, "issuer"));
+            issuers
+                .entry(issuer.clone())
+                .or_default()
+                .insert(cn.clone());
+
+            if let Some(days) = days_until(&str_of(cert, "not_after")) {
+                let e = newest.entry(cn).or_insert((days, issuer.clone()));
+                if days > e.0 {
+                    *e = (days, issuer);
+                }
+            }
+        }
+    }
+
+    let mut expiring: Vec<String> = newest
+        .into_iter()
+        // Below zero the name has no live certificate at all, which is a fact
+        // about a name that is probably gone rather than about a renewal
+        // somebody has to do this week.
+        .filter(|(_, (days, _))| (0..=soon_days).contains(days))
+        .map(|(cn, (days, issuer))| format!("{cn} in {days}d ({issuer})"))
+        .collect();
+    expiring.sort();
+
+    let mut out = Vec::new();
+    if !issuers.is_empty() {
+        let names: Vec<String> = issuers
+            .iter()
+            .map(|(issuer, hosts)| {
+                format!(
+                    "{issuer}: {}",
+                    hosts.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect();
+        let n = issuers.len();
+        // Deliberately not phrased as "authorities other than Cloudflare":
+        // Cloudflare's own universal certificates are issued by Google Trust
+        // Services and Let's Encrypt, so an issuer string cannot tell a
+        // Cloudflare certificate from one somebody obtained independently. The
+        // list is the finding; an authority nobody recognises is the signal.
+        out.push(
+            Finding::new(
+                Severity::Info,
+                "public certificates",
+                format!(
+                    "{n} certificate {} {} for these names",
+                    agree(n, "authority", "authorities"),
+                    agree(n, "has issued", "have issued")
+                ),
+            )
+            .with(names.join("; ")),
+        );
+    }
+    if !expiring.is_empty() {
+        let n = expiring.len();
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "public certificates",
+                format!(
+                    "{n} {} has no certificate valid beyond {soon_days} days",
+                    agree(n, "name", "names"),
+                ),
+            )
+            .with(expiring.join(", ")),
+        );
+    }
+    out
+}
+
+/// What the origin addresses actually are.
+///
+/// Cloudflare will tell you an origin is `203.0.113.10`. It will not tell you
+/// that the address is a residential line, a mobile network, a Tor exit or a
+/// block with no abuse contact — and each of those changes what an exposed
+/// origin costs.
+pub fn origins(addrs: &[Address]) -> Vec<Finding> {
+    let mut consumer = Vec::new();
+    let mut mobile = Vec::new();
+    let mut behind_proxy = Vec::new();
+    let mut tor = Vec::new();
+    let mut torrents = Vec::new();
+    let mut no_abuse = Vec::new();
+    let mut no_rdns = Vec::new();
+    let mut unconfirmed = Vec::new();
+    let mut reserved = Vec::new();
+    let mut jurisdictions: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+
+    for a in addrs {
+        let s = &a.scan;
+        let label = a.label();
+        let flag = |k: &str| s.get(k).and_then(Value::as_bool) == Some(true);
+        let isp = match str_of(s, "isp") {
+            i if i.is_empty() => str_of(s, "org"),
+            i => i,
+        };
+
+        if flag("reserved") {
+            reserved.push(label.clone());
+        }
+        // Only an address the world can reach is worth characterising, and only
+        // an exposed one is a bypass. An origin that is never published outside
+        // the proxy is judged by the network plane, not by this one.
+        if a.exposed {
+            // `hosting` is the load-bearing field: an origin that is not in a
+            // datacenter is somebody's connection, and the address is also the
+            // household's.
+            if !flag("hosting") && !flag("mobile") && !flag("proxy") && !flag("reserved") {
+                consumer.push(format!("{label} ({isp})"));
+            }
+            if flag("mobile") {
+                mobile.push(format!("{label} ({isp})"));
+            }
+            if flag("proxy") {
+                behind_proxy.push(format!("{label} ({isp})"));
+            }
+        }
+        if s.get("tor")
+            .and_then(|t| t.get("is_tor"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            tor.push(label.clone());
+        }
+
+        let ikwyd = s.get("ikwyd").cloned().unwrap_or(json!({}));
+        let seen = ikwyd
+            .get("observations")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if ikwyd.get("exists").and_then(Value::as_bool) == Some(true) && seen > 0 {
+            torrents.push(format!(
+                "{label} ({seen} {})",
+                agree(seen as usize, "observation", "observations")
+            ));
+        }
+
+        let rdap = s.get("rdap").cloned().unwrap_or(json!({}));
+        if rdap.get("found").and_then(Value::as_bool) == Some(true)
+            && str_of(&rdap, "abuse_email").is_empty()
+        {
+            no_abuse.push(format!("{label} ({})", str_of(&rdap, "cidr")));
+        }
+
+        let rdns = s.get("rdns").cloned().unwrap_or(json!({}));
+        match (
+            rdns.get("found").and_then(Value::as_bool),
+            rdns.get("forward_confirmed").and_then(Value::as_bool),
+        ) {
+            (Some(true), Some(false)) => {
+                unconfirmed.push(format!("{label} ({})", str_of(&rdns, "name")));
+            }
+            (Some(false), _) => no_rdns.push(label.clone()),
+            _ => {}
+        }
+
+        let country = str_of(s, "country");
+        if !country.is_empty() {
+            jurisdictions.entry(country).or_default().insert(label);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, finding: String, names: &[String]| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "origins", finding).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} exposed {} on a consumer connection rather than in a datacenter",
+            consumer.len(),
+            agree(consumer.len(), "origin sits", "origins sit")
+        ),
+        &consumer,
+    );
+    push(
+        Severity::High,
+        format!(
+            "{} exposed {} on a mobile network",
+            mobile.len(),
+            agree(mobile.len(), "origin is", "origins are")
+        ),
+        &mobile,
+    );
+    push(
+        Severity::High,
+        format!(
+            "{} {} a Tor exit node",
+            tor.len(),
+            agree(tor.len(), "address is", "addresses are")
+        ),
+        &tor,
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} exposed {} behind a VPN or proxy service",
+            behind_proxy.len(),
+            agree(behind_proxy.len(), "origin is", "origins are")
+        ),
+        &behind_proxy,
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} published {} into reserved address space",
+            reserved.len(),
+            agree(reserved.len(), "record points", "records point")
+        ),
+        &reserved,
+    );
+    push(
+        Severity::Low,
+        format!(
+            "{} origin {} peer-to-peer activity attributed to {}",
+            torrents.len(),
+            agree(torrents.len(), "address has", "addresses have"),
+            agree(torrents.len(), "it", "them")
+        ),
+        &torrents,
+    );
+    push(
+        Severity::Low,
+        format!(
+            "{} origin {} a reverse name that does not resolve back",
+            unconfirmed.len(),
+            agree(unconfirmed.len(), "address has", "addresses have")
+        ),
+        &unconfirmed,
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} origin {} no reverse name",
+            no_rdns.len(),
+            agree(no_rdns.len(), "address has", "addresses have")
+        ),
+        &no_rdns,
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} origin {} in a block with no abuse contact",
+            no_abuse.len(),
+            agree(no_abuse.len(), "address sits", "addresses sit")
+        ),
+        &no_abuse,
+    );
+
+    // Not a defect, but the one question a data-residency review always asks,
+    // and the answer is sitting in data already fetched.
+    if jurisdictions.len() > 1 {
+        let detail: Vec<String> = jurisdictions
+            .iter()
+            .map(|(c, a)| format!("{c}: {}", a.iter().cloned().collect::<Vec<_>>().join(", ")))
+            .collect();
+        out.push(
+            Finding::new(
+                Severity::Info,
+                "origins",
+                format!("origins sit in {} countries", jurisdictions.len()),
+            )
+            .with(detail.join("; ")),
+        );
+    }
+    out
+}
+
+/// The `results` object of a domain scan, whether or not the caller unwrapped
+/// the scan envelope first.
+fn scan_results(scan: &Value) -> &Value {
+    scan.get("results").unwrap_or(scan)
+}
+
+/// The `dns` object inside those results.
+///
+/// `subdomains` and `ssl` sit directly under `results`; `resolve` and `txt` sit
+/// one level further down, under `results.dns`. Reading them at the wrong depth
+/// is silent — every accessor here returns an empty default — and it produced
+/// a report claiming that names which plainly resolve resolve to nothing.
+fn scan_dns(scan: &Value) -> &Value {
+    const EMPTY: &Value = &Value::Null;
+    scan_results(scan).get("dns").unwrap_or(EMPTY)
+}
+
+/// A hostname in the form both sides can be compared in.
+fn normalise(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether `host` is the zone or sits under it.
+///
+/// Compared on label boundaries: `notmlab.sh` is not in `mlab.sh`, and a check
+/// that used `ends_with` alone would report it as one.
+fn in_zone(host: &str, zone: &str) -> bool {
+    let zone = normalise(zone);
+    let host = normalise(host);
+    host == zone || host.ends_with(&format!(".{zone}"))
+}
+
+/// Whether an address is announced by Cloudflare.
+///
+/// The published ranges, which change rarely and are checked against
+/// `cloudflare.com/ips` rather than guessed. A proxied name answers from these
+/// and from nowhere else, so an answer outside them is the origin speaking.
+fn is_cloudflare(ip: &str) -> bool {
+    const V4: &[(u8, u8, u8, u8, u8)] = &[
+        (173, 245, 48, 0, 20),
+        (103, 21, 244, 0, 22),
+        (103, 22, 200, 0, 22),
+        (103, 31, 4, 0, 22),
+        (141, 101, 64, 0, 18),
+        (108, 162, 192, 0, 18),
+        (190, 93, 240, 0, 20),
+        (188, 114, 96, 0, 20),
+        (197, 234, 240, 0, 22),
+        (198, 41, 128, 0, 17),
+        (162, 158, 0, 0, 15),
+        (104, 16, 0, 0, 13),
+        (104, 24, 0, 0, 14),
+        (172, 64, 0, 0, 13),
+        (131, 0, 72, 0, 22),
+    ];
+    // 2400:cb00::/32 and the rest all sit under these /32s.
+    const V6: &[[u16; 2]] = &[
+        [0x2400, 0xcb00],
+        [0x2606, 0x4700],
+        [0x2803, 0xf800],
+        [0x2405, 0xb500],
+        [0x2405, 0x8100],
+        [0x2a06, 0x98c0],
+        [0x2c0f, 0xf248],
+    ];
+
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let addr = u32::from(v4);
+            V4.iter().any(|&(a, b, c, d, bits)| {
+                let net = u32::from(std::net::Ipv4Addr::new(a, b, c, d));
+                let mask = u32::MAX.checked_shl(32 - u32::from(bits)).unwrap_or(0);
+                addr & mask == net & mask
+            })
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            V6.iter().any(|p| s[0] == p[0] && s[1] == p[1])
+        }
+        Err(_) => false,
+    }
+}
+
+/// The organisation out of an X.509 issuer string, for a readable detail line.
+///
+/// The value may be quoted precisely because it contains the separator —
+/// `O="CLOUDFLARE, INC."` — so a plain split on ", " truncates it to
+/// `CLOUDFLARE`, which is what the first live run printed.
+fn issuer_name(issuer: &str) -> String {
+    let Some(rest) = issuer.find("O=").map(|i| &issuer[i + 2..]) else {
+        return issuer.to_string();
+    };
+    match rest.strip_prefix('"') {
+        Some(quoted) => quoted
+            .find('"')
+            .map(|end| quoted[..end].to_string())
+            .unwrap_or_else(|| quoted.to_string()),
+        None => rest.split(", ").next().unwrap_or(rest).to_string(),
+    }
+}
+
+/// The `p=` policy of a DMARC record.
+fn policy_of(dmarc: &str) -> Option<String> {
+    dmarc
+        .split(';')
+        .map(str::trim)
+        .find_map(|t| t.strip_prefix("p="))
+        .map(|p| p.trim().to_ascii_lowercase())
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -6267,5 +7044,519 @@ mod tests {
         assert_eq!(agree(1, "token has", "tokens have"), "token has");
         assert_eq!(agree(0, "token has", "tokens have"), "tokens have");
         assert_eq!(agree(2, "token has", "tokens have"), "tokens have");
+    }
+    // ---- the outside view --------------------------------------------------
+
+    /// A domain scan in the shape the service actually returns, trimmed from a
+    /// recorded response.
+    ///
+    /// The nesting is the point: `subdomains` and `ssl` sit under `results`,
+    /// while `resolve` and `txt` sit under `results.dns`. Reading either at the
+    /// wrong depth is silent — every accessor defaults to empty — and it once
+    /// produced a report claiming that names which plainly resolve resolve to
+    /// nothing. A fixture with the real nesting is what catches that.
+    fn scan(subdomains: Value, resolve: Value, ssl: Value, txt: Value) -> Value {
+        json!({
+            "domain": "example.test",
+            "status": "completed",
+            "results": {
+                "dns": { "resolve": resolve, "txt": txt },
+                "files": { "robots_txt": "not found", "security_txt": "not found" },
+                "ssl": ssl,
+                "subdomains": subdomains,
+                "subdomains_suspicious": [],
+            }
+        })
+    }
+
+    fn outside(known: &[&str], scan: Value) -> Outside {
+        Outside {
+            zone: "example.test".into(),
+            known: known.iter().map(|s| s.to_string()).collect(),
+            cf_spf: false,
+            cf_dmarc: false,
+            scan,
+        }
+    }
+
+    #[test]
+    fn a_name_the_world_resolves_and_the_zone_does_not_hold_is_the_headline() {
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!(["ghost.example.test"]),
+                json!([{"domain": "ghost.example.test", "a": ["203.0.113.9"], "aaaa": [], "cname": null}]),
+                json!([]),
+                json!({}),
+            ),
+        );
+        let f = shadow(&[z]);
+        assert_eq!(f[0].severity, Severity::High);
+        assert!(f[0].finding.contains("resolves"));
+        assert_eq!(f[0].detail, "ghost.example.test");
+    }
+
+    /// The bug this guards: `dns.resolve` does not list every discovered name.
+    /// Two hostnames that answer perfectly well were missing from it on a real
+    /// scan, so absence from it cannot mean "does not resolve" — and no finding
+    /// here may say that it does.
+    #[test]
+    fn a_name_missing_from_resolve_is_never_called_dead() {
+        let z = outside(
+            &["example.test", "known.example.test"],
+            scan(
+                json!(["known.example.test", "other.example.test"]),
+                // Neither discovered name appears here.
+                json!([{"domain": "example.test", "a": ["104.26.2.236"], "aaaa": [], "cname": null}]),
+                json!([]),
+                json!({}),
+            ),
+        );
+        let f = shadow(&[z]);
+        for finding in &f {
+            let text = format!("{} {}", finding.finding, finding.detail);
+            assert!(
+                !text.contains("resolve to nothing") && !text.contains("resolves to nothing"),
+                "claimed non-resolution from an absence: {text}"
+            );
+            // A name the zone does hold is not a shadow name at all.
+            assert!(!finding.detail.contains("known.example.test"));
+        }
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Medium && x.detail == "other.example.test"));
+    }
+
+    #[test]
+    fn a_name_is_reported_once_under_its_strongest_evidence() {
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!(["ghost.example.test"]),
+                json!([{"domain": "ghost.example.test", "a": ["203.0.113.9"], "aaaa": [], "cname": null}]),
+                json!([{"common_name": "ghost.example.test", "issuer": "C=US, O=Let's Encrypt, CN=R13",
+                        "not_after": "2099-01-01T00:00:00", "not_before": "2020-01-01T00:00:00", "serial": "01"}]),
+                json!({}),
+            ),
+        );
+        let f = shadow(&[z]);
+        let mentions = f
+            .iter()
+            .filter(|x| x.detail.contains("ghost.example.test"))
+            .count();
+        assert_eq!(mentions, 1, "one name, one finding");
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn cloudflares_own_universal_certificates_are_not_shadow_names() {
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([{"common_name": "fc4eb8e7.sni.cloudflaressl.com",
+                        "issuer": "C=US, O=Google Trust Services, CN=WR1",
+                        "not_after": "2099-01-01T00:00:00", "not_before": "2020-01-01T00:00:00", "serial": "01"}]),
+                json!({}),
+            ),
+        );
+        assert!(shadow(&[z]).is_empty());
+    }
+
+    #[test]
+    fn a_wildcard_certificate_is_judged_as_the_name_it_wraps() {
+        let z = outside(
+            &["example.test", "staging.example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([
+                    {"common_name": "*.staging.example.test", "issuer": "C=US, O=Let's Encrypt, CN=R13",
+                     "not_after": "2099-01-01T00:00:00", "not_before": "2020-01-01T00:00:00", "serial": "01"},
+                    {"common_name": "*.gone.example.test", "issuer": "C=US, O=Let's Encrypt, CN=R13",
+                     "not_after": "2099-01-01T00:00:00", "not_before": "2020-01-01T00:00:00", "serial": "02"}
+                ]),
+                json!({}),
+            ),
+        );
+        let f = shadow(&[z]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].detail, "gone.example.test");
+    }
+
+    #[test]
+    fn a_name_outside_the_zone_is_not_a_name_in_it() {
+        assert!(in_zone("a.example.test", "example.test"));
+        assert!(in_zone("example.test", "example.test"));
+        assert!(in_zone("EXAMPLE.TEST.", "example.test"));
+        // The label boundary: without it, a domain somebody else owns is
+        // reported as a shadow name in this zone.
+        assert!(!in_zone("notexample.test", "example.test"));
+        assert!(!in_zone("example.test.evil.com", "example.test"));
+    }
+
+    #[test]
+    fn cloudflares_ranges_are_recognised_and_nothing_else_is() {
+        for ip in [
+            "104.26.2.236",
+            "172.67.73.61",
+            "104.21.19.25",
+            "2606:4700:20::681a:3ec",
+            "2803:f800::1",
+        ] {
+            assert!(is_cloudflare(ip), "{ip} is Cloudflare space");
+        }
+        // 104.15.255.255 and 2600:4700::1 sit just outside the ranges above,
+        // which is where an off-by-one in the mask arithmetic would show.
+        for ip in [
+            "93.184.216.34",
+            "8.8.8.8",
+            "104.15.255.255",
+            "2600:4700::1",
+            "nonsense",
+        ] {
+            assert!(!is_cloudflare(ip), "{ip} is not Cloudflare space");
+        }
+    }
+
+    #[test]
+    fn a_name_answering_outside_cloudflare_means_the_proxy_is_not_in_the_path() {
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([
+                    {"domain": "proxied.example.test", "a": ["104.26.2.236"], "aaaa": [], "cname": null},
+                    {"domain": "direct.example.test", "a": ["203.0.113.9"], "aaaa": [], "cname": null}
+                ]),
+                json!([]),
+                json!({}),
+            ),
+        );
+        let f = drift(&[z]);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].detail.starts_with("direct.example.test"));
+        assert!(!f[0].detail.contains("proxied"));
+    }
+
+    #[test]
+    fn the_inside_and_outside_mail_policies_are_compared_both_ways() {
+        let case = |cf_spf, cf_dmarc, txt: Value| {
+            let mut z = outside(
+                &["example.test"],
+                scan(json!([]), json!([]), json!([]), txt),
+            );
+            z.cf_spf = cf_spf;
+            z.cf_dmarc = cf_dmarc;
+            live_mail(&[z])
+        };
+
+        // In the zone, absent live: whatever Cloudflare holds is not what the
+        // world gets, so the record enforces nothing.
+        let f = case(true, true, json!({}));
+        assert!(f.iter().any(
+            |x| x.finding.contains("does not resolve") || x.finding.contains("do not resolve")
+        ));
+
+        // Live, absent from the zone: something other than this account is
+        // answering for the name.
+        let f = case(
+            false,
+            false,
+            json!({"spf": "v=spf1 -all", "dmarc": "v=DMARC1; p=reject;"}),
+        );
+        assert!(f
+            .iter()
+            .any(|x| x.finding.contains("something else answers")));
+
+        // Agreeing on both sides is not a finding about authority.
+        let f = case(
+            true,
+            true,
+            json!({"spf": "v=spf1 -all", "dmarc": "v=DMARC1; p=reject;"}),
+        );
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn a_monitoring_dmarc_and_an_open_spf_are_graded_on_what_they_do() {
+        let mut z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([]),
+                json!({"spf": "v=spf1 +all", "dmarc": "v=DMARC1; p=none; rua=mailto:a@b.c"}),
+            ),
+        );
+        z.cf_spf = true;
+        z.cf_dmarc = true;
+        let f = live_mail(&[z]);
+        assert!(f.iter().any(|x| x.finding.contains("p=none")));
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::High && x.finding.contains("every sender")));
+    }
+
+    #[test]
+    fn a_dmarc_policy_is_read_from_the_tag_and_not_from_the_string() {
+        assert_eq!(
+            policy_of("v=DMARC1; p=none; rua=x").as_deref(),
+            Some("none")
+        );
+        assert_eq!(policy_of("v=DMARC1;p=reject").as_deref(), Some("reject"));
+        // `sp=` is the subdomain policy and is not `p=`.
+        assert_eq!(
+            policy_of("v=DMARC1; sp=none; p=quarantine").as_deref(),
+            Some("quarantine")
+        );
+        assert_eq!(policy_of("v=DMARC1"), None);
+    }
+
+    /// The bug this guards: a transparency log holds every certificate ever
+    /// issued for a name, so counting all of them reported six imminent
+    /// expiries on a zone whose live certificates were all months away.
+    #[test]
+    fn only_the_newest_certificate_for_a_name_can_be_about_to_expire() {
+        let cert = |cn: &str, not_after: &str, serial: &str| {
+            json!({"common_name": cn, "issuer": "C=US, O=Let's Encrypt, CN=R13",
+                   "not_after": not_after, "not_before": "2020-01-01T00:00:00", "serial": serial})
+        };
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([
+                    cert("example.test", "2020-01-05T00:00:00", "01"),
+                    cert("example.test", "2099-01-01T00:00:00", "02"),
+                ]),
+                json!({}),
+            ),
+        );
+        let f = public_certs(&[z], 30);
+        assert!(
+            !f.iter().any(|x| x.severity == Severity::Medium),
+            "a superseded certificate is history, not an expiry: {f:?}"
+        );
+        // The issuers are still reported, because an unexpected one is the
+        // signal this check exists for.
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Info);
+        assert!(f[0].detail.contains("Let's Encrypt"));
+
+        // The same shape with both certificates live and one inside the
+        // window: the renewal already happened, so there is nothing to do.
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([
+                    cert("example.test", &in_days(10), "01"),
+                    cert("example.test", &in_days(400), "02"),
+                ]),
+                json!({}),
+            ),
+        );
+        assert!(
+            !public_certs(&[z], 30)
+                .iter()
+                .any(|x| x.severity == Severity::Medium),
+            "the newest certificate is the one in service"
+        );
+
+        // And when the newest really is inside the window, it is reported.
+        let z = outside(
+            &["example.test"],
+            scan(
+                json!([]),
+                json!([]),
+                json!([
+                    cert("example.test", &in_days(-100), "01"),
+                    cert("example.test", &in_days(9), "02"),
+                ]),
+                json!({}),
+            ),
+        );
+        let f = public_certs(&[z], 30);
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Medium && x.detail.contains("in 9d")));
+    }
+
+    #[test]
+    fn an_issuer_is_named_by_its_organisation() {
+        assert_eq!(
+            issuer_name("C=US, O=Let's Encrypt, CN=R13"),
+            "Let's Encrypt"
+        );
+        assert_eq!(
+            issuer_name("C=US, O=\"CLOUDFLARE, INC.\", CN=Cloudflare TLS Issuing ECC CA 1"),
+            "CLOUDFLARE, INC."
+        );
+        assert_eq!(issuer_name("no fields here"), "no fields here");
+    }
+
+    // ---- origins -----------------------------------------------------------
+
+    fn addr(exposed: bool, scan: Value) -> Address {
+        Address {
+            names: vec!["www.example.test".into()],
+            addr: "203.0.113.9".into(),
+            exposed,
+            scan,
+        }
+    }
+
+    #[test]
+    fn an_exposed_origin_on_a_consumer_line_is_the_worst_kind_of_origin() {
+        let a = addr(
+            true,
+            json!({"hosting": false, "mobile": false, "proxy": false,
+                                  "reserved": false, "isp": "Some ISP", "country": "France"}),
+        );
+        let f = origins(&[a]);
+        assert_eq!(f[0].severity, Severity::High);
+        assert!(f[0].finding.contains("consumer connection"));
+        assert!(f[0].detail.contains("www.example.test → 203.0.113.9"));
+        assert!(f[0].detail.contains("Some ISP"));
+    }
+
+    /// An origin the proxy actually hides is not exposed by being an origin,
+    /// so the network it sits on is not a finding about this account.
+    #[test]
+    fn an_origin_behind_the_proxy_is_not_reported_for_its_network() {
+        let a = addr(
+            false,
+            json!({"hosting": false, "mobile": true, "proxy": true,
+                                   "reserved": false, "isp": "Some ISP"}),
+        );
+        assert!(origins(&[a]).is_empty());
+    }
+
+    #[test]
+    fn a_datacentre_origin_is_not_a_consumer_line() {
+        let a = addr(
+            true,
+            json!({"hosting": true, "mobile": false, "proxy": false,
+                                  "reserved": false, "isp": "A Host"}),
+        );
+        assert!(origins(&[a]).is_empty());
+    }
+
+    #[test]
+    fn tor_reserved_and_reputation_are_judged_on_any_published_address() {
+        let a = Address {
+            names: vec!["a.example.test".into()],
+            addr: "203.0.113.9".into(),
+            // Not exposed: these three are facts about the address itself.
+            exposed: false,
+            scan: json!({
+                "hosting": true, "reserved": true,
+                "tor": {"is_tor": true, "available": true},
+                "ikwyd": {"exists": true, "observations": 4},
+                "rdap": {"found": true, "abuse_email": "", "cidr": "203.0.113.0/24"},
+                "rdns": {"found": false},
+            }),
+        };
+        let f = origins(&[a]);
+        let says = |t: &str| f.iter().any(|x| x.finding.contains(t));
+        assert!(says("Tor exit node"));
+        assert!(says("reserved address space"));
+        assert!(says("peer-to-peer activity"));
+        assert!(says("no abuse contact"));
+        assert!(says("no reverse name"));
+    }
+
+    #[test]
+    fn a_reverse_name_that_does_not_resolve_back_is_distinct_from_having_none() {
+        let a = addr(
+            true,
+            json!({"hosting": true, "rdns": {"found": true,
+                                  "forward_confirmed": false, "name": "host.isp.test"}}),
+        );
+        let f = origins(&[a]);
+        assert!(f
+            .iter()
+            .any(|x| x.finding.contains("does not resolve back")));
+        assert!(!f.iter().any(|x| x.finding.contains("no reverse name")));
+    }
+
+    #[test]
+    fn origins_in_more_than_one_country_are_worth_saying_out_loud() {
+        let one = |c: &str, ip: &str| Address {
+            names: vec![format!("{c}.example.test")],
+            addr: ip.into(),
+            exposed: true,
+            scan: json!({"hosting": true, "country": c}),
+        };
+        assert!(origins(&[one("France", "203.0.113.1")]).is_empty());
+        let f = origins(&[one("France", "203.0.113.1"), one("Canada", "203.0.113.2")]);
+        assert!(f.iter().any(|x| x.finding.contains("2 countries")));
+    }
+
+    // ---- what gets looked up -----------------------------------------------
+
+    #[test]
+    fn one_address_is_one_lookup_however_many_names_publish_it() {
+        let recs = json!([
+            {"type": "A", "name": "a.example.test", "content": "93.184.216.34", "proxied": true},
+            {"type": "A", "name": "b.example.test", "content": "93.184.216.34", "proxied": true},
+        ]);
+        let got = public_addresses(recs.as_array().unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "93.184.216.34");
+        assert_eq!(got[0].1, vec!["a.example.test", "b.example.test"]);
+        assert!(!got[0].2, "every record is proxied, so nothing is exposed");
+    }
+
+    #[test]
+    fn an_address_is_exposed_when_one_record_publishes_it_around_the_proxy() {
+        let recs = json!([
+            {"type": "A", "name": "www.example.test", "content": "93.184.216.34", "proxied": true},
+            {"type": "A", "name": "direct.example.test", "content": "93.184.216.34", "proxied": false},
+        ]);
+        let got = public_addresses(recs.as_array().unwrap());
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].2,
+            "one unproxied record is enough to expose the origin"
+        );
+    }
+
+    /// Exposure is Cloudflare fronting for an address *and* publishing a route
+    /// around itself. An address Cloudflare never proxies is just an address —
+    /// a mail server, a stray host — and calling it an exposed origin would
+    /// report every unproxied record in the account.
+    #[test]
+    fn an_address_the_proxy_never_fronts_for_is_not_an_exposed_origin() {
+        let recs = json!([
+            {"type": "A", "name": "mail.example.test", "content": "93.184.216.34", "proxied": false},
+            {"type": "A", "name": "smtp.example.test", "content": "93.184.216.34", "proxied": false},
+        ]);
+        let got = public_addresses(recs.as_array().unwrap());
+        assert_eq!(got.len(), 1);
+        assert!(
+            !got[0].2,
+            "nothing is bypassed when nothing was in front of it"
+        );
+    }
+
+    #[test]
+    fn filler_and_private_addresses_are_never_looked_up() {
+        // Each would spend a unit of somebody's daily quota to learn nothing.
+        let recs = json!([
+            {"type": "A", "name": "a.example.test", "content": "192.0.2.1", "proxied": true},
+            {"type": "A", "name": "f.example.test", "content": "203.0.113.9", "proxied": false},
+            {"type": "A", "name": "b.example.test", "content": "10.0.0.1", "proxied": false},
+            {"type": "AAAA", "name": "c.example.test", "content": "100::1", "proxied": true},
+            {"type": "CNAME", "name": "d.example.test", "content": "x.test", "proxied": true},
+            {"type": "A", "name": "e.example.test", "content": "93.184.216.34", "proxied": true},
+        ]);
+        let got = public_addresses(recs.as_array().unwrap());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "93.184.216.34");
     }
 }

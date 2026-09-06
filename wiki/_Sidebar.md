@@ -7,6 +7,7 @@
 - [audit](Audit)
 - [whoami](Whoami)
 - [dns](Dns)
+- [enrich](Enrich)
 - [posture](Posture)
 - [tls](Tls)
 - [platform](Platform)

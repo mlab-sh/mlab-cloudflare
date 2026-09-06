@@ -154,3 +154,23 @@ answers the question in one run without touching what is stored.
 
 - [Errors](Errors) — the rate ceiling this exists for
 - [Secrets](Secrets) — what can end up in an entry
+
+## The mlab results
+
+[`enrich`](Enrich) holds its results somewhere else: `$HOME/.mlab/cache/cloudflare/mlab/`.
+
+They are not the same kind of thing as a Cloudflare response. A Cloudflare
+response can be fetched again for nothing; an mlab result costs a unit of a
+daily quota. Sharing one directory would mean `cache clear` throwing away a week
+of paid lookups to refresh fifteen minutes of free ones.
+
+So they are held for seven days rather than fifteen minutes, `cache status`
+counts them separately, and `cache clear` keeps them and says so:
+
+```
+  ✓ removed 61 cached responses
+  › kept 12 mlab results — they cost quota to fetch again; --all removes them too
+```
+
+`cache clear --all` removes both. `--no-cache` does not apply to them at all;
+`enrich --refresh` is the deliberate way to look something up again.

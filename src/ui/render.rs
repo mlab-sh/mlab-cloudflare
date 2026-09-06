@@ -113,6 +113,14 @@ pub const DOMAIN_COLS: &[Col] = &[
     Col("WHOIS", &["privacy"]),
 ];
 
+pub const ENRICH_PLAN_COLS: &[Col] = &[
+    Col("TARGET", &["target"]),
+    Col("QUOTA", &["quota"]),
+    Col("STATE", &["state"]),
+];
+
+pub const ENRICH_UNREAD_COLS: &[Col] = &[Col("TARGET", &["target"]), Col("WHY", &["reason"])];
+
 pub const CACHE_COLS: &[Col] = &[
     Col("REQUEST", &["request"]),
     Col("AGE", &["age"]),

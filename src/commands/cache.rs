@@ -16,20 +16,39 @@ pub enum CacheCmd {
     /// What is held, and how old it is
     #[command(alias = "show", alias = "list")]
     Status,
-    /// Delete every entry
+    /// Delete every Cloudflare entry
     #[command(alias = "purge")]
-    Clear,
+    Clear {
+        /// Also delete the mlab results, which cost quota to fetch again
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
     let cache = Cache::new(ttl, true);
+    // The mlab results are read at their own TTL: a week, because that is how
+    // long mlab keeps them, and re-fetching one costs a unit of a daily quota.
+    let enriched = Cache::named(crate::mlab::CACHE_DIR, crate::mlab::TTL, true);
 
     match cmd {
         // Plain, so it composes into another command.
         CacheCmd::Path => println!("{}", crate::cf::cache::path().display()),
-        CacheCmd::Clear => {
+        CacheCmd::Clear { all } => {
             let n = cache.clear()?;
             ui::success(&format!("removed {n} cached {}", plural(n, "response")));
+            let held = enriched.entries().len();
+            if *all {
+                let m = enriched.clear()?;
+                ui::success(&format!("removed {m} mlab {}", plural(m, "result")));
+            } else if held > 0 {
+                // Silently keeping them would be worse than saying so: the
+                // reader asked for the cache to be emptied and it was not.
+                ui::info(&format!(
+                    "kept {held} mlab {} — they cost quota to fetch again; --all removes them too",
+                    plural(held, "result")
+                ));
+            }
         }
         CacheCmd::Status => {
             let entries = cache.entries();
@@ -69,10 +88,27 @@ pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
                 // Entries hold whatever the API returned, and some endpoints
                 // return live credentials.
                 ui::info("entries hold raw API responses, some of which carry credentials; the directory is 0700 and the files 0600");
+
+                let mlab = enriched.entries();
+                if !mlab.is_empty() {
+                    ui::gap();
+                    ui::info(&format!(
+                        "{} mlab {} held for {} days, in {}",
+                        mlab.len(),
+                        plural(mlab.len(), "result"),
+                        crate::mlab::TTL.as_secs() / 86_400,
+                        enriched_path().display()
+                    ));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Where the mlab results are held, for the status line.
+fn enriched_path() -> std::path::PathBuf {
+    crate::cf::cache::path().join(crate::mlab::CACHE_DIR)
 }
 
 fn plural(n: usize, noun: &str) -> String {

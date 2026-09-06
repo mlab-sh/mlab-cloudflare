@@ -51,6 +51,11 @@ pub async fn run(ov: &Overrides, args: &LoginArgs) -> Result<()> {
         account: ov.account.clone().unwrap_or_else(|| base.account.clone()),
         zone: ov.zone.clone().unwrap_or_else(|| base.zone.clone()),
         output: ov.output.clone().or(base.output.clone()),
+        // A second service's key, kept when it is not being changed. It is
+        // never prompted for: `enrich` is the only command that uses it, and
+        // asking everyone who logs in for a credential most of them do not have
+        // would be a worse first run than the one error `enrich` prints.
+        mlab_key: ov.mlab_key.clone().unwrap_or_else(|| base.mlab_key.clone()),
         ..Default::default()
     };
 

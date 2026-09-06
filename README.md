@@ -70,6 +70,7 @@ which is where wrangler and the Terraform provider already put them.
 | `platform` | What developers provisioned, and what it is reachable on. Graded findings. |
 | `zerotrust` | Who reaches internal systems, and is fleet traffic inspected. Graded findings. |
 | `network` | The routed estate: tunnels, routes, announced space, balancers. Graded findings. |
+| `enrich` | The same account seen from outside it, via mlab.sh. Graded findings. |
 | `snapshot` | One dated, credential-free record of everything the account holds. |
 | `diff` | What changed between two snapshots. |
 | `egress` | Where the request data goes, and whether any of it is kept. Graded findings. |

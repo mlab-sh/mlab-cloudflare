@@ -40,6 +40,13 @@ pub struct AuditArgs {
     /// Print every finding rather than the worst of each severity
     #[arg(long)]
     pub full: bool,
+
+    /// Include what `enrich` already looked up from outside the account
+    ///
+    /// Reads only held results and never spends mlab quota; run `enrich` to
+    /// fetch them.
+    #[arg(long)]
+    pub enrich: bool,
 }
 
 pub async fn run(c: &Client, ctx: &Ctx, a: &AuditArgs) -> Result<i32> {
@@ -83,6 +90,21 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &AuditArgs) -> Result<i32> {
             Err(e) => broken.push(format!("{plane}: {}", one_line(&e))),
         }
     }
+
+    // The outside view, when there is one to read. Opt-in and held-only: this
+    // command spends no quota, so a target nobody has looked up yet is counted
+    // as unread rather than fetched.
+    let mut not_enriched = 0usize;
+    if a.enrich {
+        let zones = commands::zones_in_scope(c, ctx).await?;
+        match commands::enrich::held_findings(c, ctx, &zones, 30).await {
+            Ok((f, missing)) => {
+                findings.extend(f);
+                not_enriched = missing;
+            }
+            Err(e) => broken.push(format!("enrich: {}", one_line(&e))),
+        }
+    }
     let findings = checks::sorted(findings);
     let unread = unread_from(&recorder);
 
@@ -107,6 +129,7 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &AuditArgs) -> Result<i32> {
                 }))
                 .collect::<Vec<_>>(),
             "planesFailed": broken,
+            "notEnriched": not_enriched,
             "failOn": a.fail_on,
             "exitCode": if tripped { FOUND } else { 0 },
         }));
@@ -146,7 +169,24 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &AuditArgs) -> Result<i32> {
         "not read",
         unread.iter().map(|(_, _, n)| n).sum::<usize>().to_string(),
     ));
+    if a.enrich {
+        // Same rule as "not read", for the same reason: a target the outside
+        // view never covered must not read as a target it found nothing on.
+        pairs.push(("not looked up outside", not_enriched.to_string()));
+    }
     render::pairs(&pairs);
+
+    if a.enrich && not_enriched > 0 {
+        ui::gap();
+        ui::info(&format!(
+            "{not_enriched} {} no held mlab result; `enrich` looks them up",
+            if not_enriched == 1 {
+                "target has"
+            } else {
+                "targets have"
+            }
+        ));
+    }
 
     // Printed last and never omitted, on every plane at once. An audit that
     // does not say where it stopped looking reads as though it looked

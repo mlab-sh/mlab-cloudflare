@@ -19,6 +19,7 @@ pub struct Overrides {
     pub account: Option<String>,
     pub zone: Option<String>,
     pub output: Option<String>,
+    pub mlab_key: Option<String>,
 }
 
 impl From<&Cli> for Overrides {
@@ -31,6 +32,7 @@ impl From<&Cli> for Overrides {
             account: cli.account.clone(),
             zone: cli.zone.clone(),
             output: cli.output.clone(),
+            mlab_key: cli.mlab_key.clone(),
         }
     }
 }
@@ -81,6 +83,16 @@ impl Ctx {
         if let Some(v) = config::env("ZONE_ID") {
             p.zone = v;
         }
+        // Its own name, because it is a key for a different service: reading
+        // CLOUDFLARE_API_TOKEN into it would be a category error.
+        for key in ["MLAB_API_KEY", "MLAB_KEY"] {
+            if let Ok(v) = std::env::var(key) {
+                if !v.is_empty() {
+                    p.mlab_key = v;
+                    break;
+                }
+            }
+        }
         // The mode is inferred rather than asked for: a bare CLOUDFLARE_API_KEY
         // in the environment is unambiguous, and making CI set a second
         // variable to explain the first one is how credentials end up hardcoded.
@@ -113,6 +125,9 @@ impl Ctx {
         }
         if let Some(v) = &ov.zone {
             p.zone = v.clone();
+        }
+        if let Some(v) = &ov.mlab_key {
+            p.mlab_key = v.clone();
         }
 
         // The flag and the environment were applied at startup; a profile-level

@@ -11,6 +11,7 @@ pub mod audit;
 pub mod cache;
 pub mod dns;
 pub mod egress;
+pub mod enrich;
 pub mod identity;
 pub mod login;
 pub mod network;

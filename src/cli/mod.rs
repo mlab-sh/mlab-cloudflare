@@ -60,6 +60,10 @@ pub struct Cli {
     #[arg(long, short = 'z', global = true, value_name = "ZONE")]
     pub zone: Option<String>,
 
+    /// mlab.sh API key for `enrich`; prefer MLAB_API_KEY
+    #[arg(long, global = true, value_name = "KEY")]
+    pub mlab_key: Option<String>,
+
     /// Output format: a terminal render, or raw JSON for scripting
     #[arg(long, short = 'o', global = true, value_parser = ["human", "json"], value_name = "FORMAT")]
     pub output: Option<String>,
@@ -129,6 +133,9 @@ pub enum Cmd {
 
     /// Every plane, one graded report, one exit code
     Audit(commands::audit::AuditArgs),
+
+    /// The same account seen from outside it, via mlab.sh
+    Enrich(commands::enrich::EnrichArgs),
 
     /// One dated, credential-free record of everything the account holds
     Snapshot(commands::snapshot::SnapshotArgs),
@@ -274,6 +281,7 @@ pub async fn run() -> Result<i32> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Enrich(a) => commands::enrich::run(&c, &ctx, &a).await,
         Cmd::Snapshot(a) => commands::snapshot::run(&c, &ctx, &a).await,
         Cmd::Network { cmd } => commands::network::run(&c, &ctx, cmd).await,
         Cmd::Egress { cmd } => commands::egress::run_egress(&c, &ctx, cmd).await,

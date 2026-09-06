@@ -86,9 +86,25 @@ pub struct Cache {
 }
 
 impl Cache {
+    /// The Cloudflare cache: free reads, held for minutes.
     pub fn new(ttl: Duration, read: bool) -> Cache {
         Cache {
             dir: path(),
+            ttl,
+            read,
+        }
+    }
+
+    /// A cache of its own, under `name`.
+    ///
+    /// The mlab results live here rather than beside the Cloudflare ones
+    /// because the two are not the same kind of thing: a Cloudflare response
+    /// can be fetched again for nothing, and an mlab result costs a unit of a
+    /// daily quota. Sharing a directory would mean `cache clear` throwing away
+    /// a week of paid lookups to refresh fifteen minutes of free ones.
+    pub fn named(name: &str, ttl: Duration, read: bool) -> Cache {
+        Cache {
+            dir: path().join(name),
             ttl,
             read,
         }

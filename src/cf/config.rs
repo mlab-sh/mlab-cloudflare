@@ -102,6 +102,13 @@ pub struct Profile {
     /// Default zone id for zone-scoped commands.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub zone: String,
+    /// mlab.sh API key, used by `enrich` and by nothing else.
+    ///
+    /// A second credential for a second service: it buys the outside view that
+    /// the Cloudflare API cannot give, and it is stored beside the first
+    /// because both are secrets and the file already protects one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mlab_key: String,
     /// `json` or `human`; `None` means the global default (`human`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
@@ -136,6 +143,7 @@ impl Profile {
         let mut p = self.clone();
         p.token = redact(&self.token);
         p.api_key = redact(&self.api_key);
+        p.mlab_key = redact(&self.mlab_key);
         p
     }
 }
@@ -328,12 +336,17 @@ mod tests {
             auth: Auth::Key,
             token: "tokenvalue".into(),
             api_key: "keyvalue".into(),
+            mlab_key: "mlabvalue".into(),
             email: "a@b.c".into(),
             ..Default::default()
         };
         let r = p.redacted();
         assert_eq!(r.token, "****alue");
         assert_eq!(r.api_key, "****alue");
+        assert_eq!(
+            r.mlab_key, "****alue",
+            "a second service is a second secret"
+        );
         assert_eq!(
             r.email, "a@b.c",
             "the email is not a secret, and identifies"
