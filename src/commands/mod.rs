@@ -7,9 +7,12 @@
 pub mod accounts;
 pub mod activity;
 pub mod api;
+pub mod cache;
+pub mod dns;
 pub mod identity;
 pub mod login;
 pub mod ping;
+pub mod posture;
 pub mod profile;
 pub mod prompt;
 pub mod settings;

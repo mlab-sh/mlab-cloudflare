@@ -7,7 +7,6 @@
 
 use anyhow::Result;
 use clap::Subcommand;
-use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::audit::{self, Finding};
@@ -84,37 +83,37 @@ pub async fn run(c: &Client, ctx: &Ctx, cmd: Option<IdentityCmd>) -> Result<()> 
 async fn gather(c: &Client, account_id: &str) -> Result<Reads> {
     let acct = format!("/accounts/{}", esc(account_id));
 
-    let account = ui::spin(
-        "Reading the account",
-        c.request(Method::GET, &acct, &[], None),
-    )
-    .await?;
+    let account = ui::spin("Reading the account", c.cached(&acct, &[])).await?;
 
     let opt = |r: Result<Vec<Value>>| r.map_err(|e| format!("{e:#}"));
 
     let members = opt(ui::spin(
         "Listing members",
-        c.list(&format!("{acct}/members"), &[], None),
+        c.cached_list(&format!("{acct}/members"), &[], None),
     )
     .await);
 
     let account_tokens = opt(ui::spin(
         "Listing account tokens",
-        c.list(&format!("{acct}/tokens"), &[], None),
+        c.cached_list(&format!("{acct}/tokens"), &[], None),
     )
     .await);
 
-    let user_tokens = opt(ui::spin("Listing user tokens", c.list("/user/tokens", &[], None)).await);
+    let user_tokens = opt(ui::spin(
+        "Listing user tokens",
+        c.cached_list("/user/tokens", &[], None),
+    )
+    .await);
 
     let sso = opt(ui::spin(
         "Reading SSO",
-        c.list(&format!("{acct}/sso_connectors"), &[], None),
+        c.cached_list(&format!("{acct}/sso_connectors"), &[], None),
     )
     .await);
 
     let scim = ui::spin(
         "Reading SCIM users",
-        c.request(Method::GET, &format!("{acct}/scim/v2/Users"), &[], None),
+        c.cached(&format!("{acct}/scim/v2/Users"), &[]),
     )
     .await
     .map(|v| scim_users(&v))
@@ -122,13 +121,13 @@ async fn gather(c: &Client, account_id: &str) -> Result<Reads> {
 
     let groups = opt(ui::spin(
         "Listing IAM groups",
-        c.list(&format!("{acct}/iam/user_groups"), &[], None),
+        c.cached_list(&format!("{acct}/iam/user_groups"), &[], None),
     )
     .await);
 
     let oauth = opt(ui::spin(
         "Listing OAuth clients",
-        c.list(&format!("{acct}/oauth_clients"), &[], None),
+        c.cached_list(&format!("{acct}/oauth_clients"), &[], None),
     )
     .await);
 

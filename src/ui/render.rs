@@ -86,6 +86,68 @@ pub const POLICY_COLS: &[Col] = &[
     Col("PERMISSIONS", &["permissions"]),
 ];
 
+/// DNS records, read as the map of what a zone points at.
+pub const DNS_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("TYPE", &["type"]),
+    Col("CONTENT", &["content"]),
+    Col("PROXIED", &["proxied"]),
+    Col("TTL", &["ttl"]),
+    Col("COMMENT", &["comment"]),
+];
+
+/// One row per zone: can it be sent mail as, and what does it say about it.
+pub const MAIL_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("MX", &["mx"]),
+    Col("SPF", &["spf"]),
+    Col("DMARC", &["dmarc"]),
+];
+
+pub const DOMAIN_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("STATUS", &["status"]),
+    Col("EXPIRES", &["expires"]),
+    Col("AUTO-RENEW", &["autoRenew"]),
+    Col("LOCKED", &["locked"]),
+    Col("WHOIS", &["privacy"]),
+];
+
+pub const CACHE_COLS: &[Col] = &[
+    Col("REQUEST", &["request"]),
+    Col("AGE", &["age"]),
+    Col("STATE", &["state"]),
+    Col("KB", &["kb"]),
+];
+
+/// One row per zone: how it speaks TLS, and whether the edge is enforcing.
+pub const POSTURE_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("PLAN", &["plan"]),
+    Col("SSL", &["ssl"]),
+    Col("MIN TLS", &["minTls"]),
+    Col("HSTS", &["hsts"]),
+    Col("HTTPS", &["https"]),
+    Col("SECURITY", &["security"]),
+    Col("DEV MODE", &["dev"]),
+];
+
+/// Rules in the order they execute, which is the only order that matters.
+pub const RULE_COLS: &[Col] = &[
+    Col("#", &["n"]),
+    Col("ACTION", &["action"]),
+    Col("ON", &["on"]),
+    Col("DESCRIPTION", &["description"]),
+    Col("EXPRESSION", &["expression"]),
+];
+
+pub const EDGE_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("KIND", &["kind"]),
+    Col("WHAT", &["what"]),
+    Col("TARGET", &["target"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),
@@ -147,19 +209,25 @@ pub fn findings(rows: &[Value]) {
         return;
     }
 
-    let width = rows
-        .iter()
-        .map(|f| str_at(f, "severity").chars().count())
-        .max()
-        .unwrap_or(0);
+    // Both leading columns are padded to their widest value so the sentences
+    // start on one line down the block; an unpadded area column makes the
+    // findings read as ragged rather than as a list.
+    let width_of = |key: &str| {
+        rows.iter()
+            .map(|f| str_at(f, key).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (sev_w, area_w) = (width_of("severity"), width_of("area"));
+    let indent = sev_w + area_w + 4;
 
     println!();
     for f in rows {
         let sev = str_at(f, "severity");
         println!(
             "  {}  {}  {}",
-            format!("{sev:<width$}").bold().color(severity_color(&sev)),
-            str_at(f, "area").dimmed(),
+            format!("{sev:<sev_w$}").bold().color(severity_color(&sev)),
+            format!("{:<area_w$}", str_at(f, "area")).dimmed(),
             str_at(f, "finding")
         );
         let detail = str_at(f, "detail");
@@ -167,7 +235,7 @@ pub fn findings(rows: &[Value]) {
             // Indented under the sentence it belongs to, and wrapped rather
             // than clipped, because these are the names to act on.
             for line in wrap(&detail, 88) {
-                println!("  {}{}", " ".repeat(width + 2), line.dimmed());
+                println!("  {}{}", " ".repeat(indent), line.dimmed());
             }
         }
     }
@@ -186,17 +254,23 @@ fn str_at(v: &Value, k: &str) -> String {
     v.get(k).and_then(Value::as_str).unwrap_or("").to_string()
 }
 
-/// Break a comma-separated detail into lines of at most `width` characters,
-/// on separator boundaries so no name is split in half.
+/// Break a detail into lines of at most `width` characters, on separator
+/// boundaries so no item is split in half.
+///
+/// Findings use two separators: a comma between plain names, and a semicolon
+/// between items that contain commas of their own. Breaking on the comma when
+/// the semicolon is the real separator splits sentences mid-clause, so the
+/// outer separator wins when it is present.
 fn wrap(s: &str, width: usize) -> Vec<String> {
+    let sep = if s.contains("; ") { "; " } else { ", " };
     let mut lines = Vec::new();
     let mut cur = String::new();
-    for part in s.split(", ") {
-        if !cur.is_empty() && cur.chars().count() + 2 + part.chars().count() > width {
+    for part in s.split(sep) {
+        if !cur.is_empty() && cur.chars().count() + sep.len() + part.chars().count() > width {
             lines.push(std::mem::take(&mut cur));
         }
         if !cur.is_empty() {
-            cur.push_str(", ");
+            cur.push_str(sep);
         }
         cur.push_str(part);
     }
@@ -493,21 +567,29 @@ fn rank(key: &str) -> u8 {
 /// Colour a cell by what it says: statuses read faster than they scan.
 fn tint(s: &str) -> colored::ColoredString {
     match s {
-        "active" | "ok" | "healthy" | "on" | "verified" | "true" => s.green(),
+        "active" | "ok" | "healthy" | "on" | "verified" | "true" | "usable" => s.green(),
         // `false` is an absence, not a fault — a list of unproxied records must
         // not read as a wall of errors.
         "false" => s.dimmed(),
-        "pending" | "initializing" | "moved" | "expiring" | "degraded" => s.yellow(),
-        "deactivated" | "deleted" | "expired" | "revoked" | "off" | "unhealthy" => s.red(),
+        "pending" | "initializing" | "moved" | "expiring" | "degraded" | "registration_pending" => {
+            s.yellow()
+        }
+        "deactivated" | "deleted" | "expired" | "revoked" | "off" | "unhealthy" | "suspended"
+        | "redemption_period" | "pending_delete" => s.red(),
+        "redaction" => s.green(),
         "appeared" => s.yellow(),
         "disappeared" => s.dimmed(),
         "changed" => s.cyan(),
         "critical" => s.red().bold(),
         "high" => s.red(),
         "medium" | "weak" => s.yellow(),
-        "low" | "info" | "unknown" | "none" => s.dimmed(),
-        "allow" | "read" => s.green(),
-        "deny" | "block" | "failed" | "write" => s.red(),
+        "low" | "info" | "unknown" | "none" | "stale" => s.dimmed(),
+        "allow" | "read" | "-all" | "p=reject" => s.green(),
+        "deny" | "block" | "failed" | "write" | "+all" | "?all" | "flexible"
+        | "essentially_off" => s.red(),
+        "skip" | "log" | "full" | "1.0" | "1.1" => s.yellow(),
+        "strict" | "managed_challenge" | "challenge" | "1.2" | "1.3" => s.green(),
+        "~all" | "p=quarantine" | "p=none" | "set" => s.yellow(),
         "" => s.normal(),
         _ => s.normal(),
     }
@@ -691,6 +773,18 @@ mod tests {
             "[{\"a\":1}]",
             "objects still fall back to JSON"
         );
+    }
+
+    #[test]
+    fn the_outer_separator_wins_when_items_contain_commas_of_their_own() {
+        // Breaking on the comma here would split "skips a, b" mid-clause.
+        let detail = "zone1: rule skips a, b; zone2: rule skips c, d; zone3: rule skips e";
+        let lines = wrap(detail, 40);
+        assert!(
+            lines.iter().all(|l| !l.starts_with(char::is_whitespace)),
+            "{lines:?}"
+        );
+        assert!(lines[0].ends_with("skips a, b"), "{lines:?}");
     }
 
     #[test]

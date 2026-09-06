@@ -30,23 +30,38 @@ over fetched data) plus the two commands that use it.
 - **Not read is not clean**: every refused read is listed, and never counted as
   a pass
 
-## Phase 3 — DNS and the namespace
+## Phase 3 — DNS and the namespace — **done**
 
-The densest findings on the platform, and the phase that most benefits from
-covering a whole portfolio rather than one domain: dangling records pointing at
-deprovisioned cloud resources, unproxied records publishing the origin, DNSSEC
-stuck `pending`, mail authentication on zones that send no mail, registrar
-expiry and lock state.
+[`dns`](Dns), with `takeover`, `exposure`, `mail`, `records` and `domains`.
 
-One list call per zone.
+- A provider suffix table graded by how claimable an unclaimed name is, matched
+  on a label boundary
+- Unproxied records that publish an address also sitting behind the proxy —
+  computable from one listing, because a proxied record still reports its real
+  target
+- Private space in public DNS, wildcards, DNSSEC stuck `pending`, missing zone
+  holds
+- Mail posture from the zone's own records, with no SPF split by whether the
+  zone actually receives mail
+- Registrar expiry, auto-renew and transfer lock
 
-## Phase 4 — zone posture
+## Phase 4 — zone posture — **done**
 
-`/zones/{id}/settings` is one call and answers a dozen checks: SSL mode,
-minimum TLS, HSTS, development mode, security level, caching. Paired with the
-ruleset phase entrypoints and the legacy firewall surfaces, to establish what
-actually executes and in what order — which is not what the dashboard shows
-when rules exist in both engines.
+[`posture`](Posture), with `settings`, `rules` and `edge`.
+
+- The settings blob, one call for a dozen checks: SSL mode graded by which leg
+  it leaves open, minimum TLS, HSTS read for its shape rather than its switch,
+  development mode, 0-RTT
+- The ruleset phase entry points, which are the only view that returns rules in
+  execution order — and the only store, since the deprecated `/firewall/rules`
+  is a second view of the same rules rather than a second engine
+- Skip rules naming exactly which phases and products they turn off
+- Managed rulesets weakened by an override, with OWASP paranoia levels excluded
+  as tuning rather than bypass
+- Spectrum applications graded by port, worker routes, snippets
+- **Entitlement awareness**: a free zone answers 404 on the managed and
+  rate-limit phases, and reporting that as unconfigured would have produced 36
+  false findings on a 19-zone account
 
 ## Phase 5 — certificates and origin trust
 

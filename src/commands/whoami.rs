@@ -166,9 +166,12 @@ async fn report_key(c: &Client, ctx: &Ctx) -> Result<()> {
         c.request(Method::GET, "/user", &[], None),
     )
     .await?;
-    let memberships = ui::spin("Listing memberships", c.list("/memberships", &[], None))
-        .await
-        .unwrap_or_default();
+    let memberships = ui::spin(
+        "Listing memberships",
+        c.cached_list("/memberships", &[], None),
+    )
+    .await
+    .unwrap_or_default();
     let (accounts, zones) = reach(c).await;
 
     let out = json!({
@@ -223,10 +226,10 @@ async fn report_key(c: &Client, ctx: &Ctx) -> Result<()> {
 /// Both listings are allowed to fail: a token scoped to one zone gets a 403 on
 /// `/accounts` and still works perfectly for that zone.
 async fn reach(c: &Client) -> (Vec<Value>, Vec<Value>) {
-    let accounts = ui::spin("Listing accounts", c.list("/accounts", &[], None))
+    let accounts = ui::spin("Listing accounts", c.cached_list("/accounts", &[], None))
         .await
         .unwrap_or_default();
-    let zones = ui::spin("Listing zones", c.list("/zones", &[], None))
+    let zones = ui::spin("Listing zones", c.cached_list("/zones", &[], None))
         .await
         .unwrap_or_default();
     let name = |v: &Value| json!({"id": str_of(v, "id"), "name": str_of(v, "name")});

@@ -15,6 +15,7 @@ mod audit;
 mod cf;
 mod cli;
 mod commands;
+mod providers;
 mod ui;
 
 use colored::Colorize;

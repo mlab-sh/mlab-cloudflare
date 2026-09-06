@@ -61,11 +61,14 @@ which is where wrangler and the Terraform provider already put them.
 | `ping` | Check that the current profile reaches the API. |
 | `accounts` | Accounts this credential reaches. |
 | `zones` | Zones of the account being scanned, and which of them enforce nothing. |
+| `dns` | What the zones point at, and what points nowhere. Graded findings. |
+| `posture` | What the edge enforces, and what is carved out of it. Graded findings. |
 | `identity` | Who can change this account, and with what. Graded findings. |
 | `activity` | What was actually done to this account, and by whom. |
 | `api` | Raw request against any endpoint, for everything not wrapped yet. |
 | `profile` | List, show, select and delete saved profiles. |
 | `config` | Where the config file is, and what is in it. |
+| `cache` | What the response cache holds, and how to empty it. |
 
 Every command renders to the terminal by default and to raw JSON with
 `-o json`.
@@ -79,6 +82,14 @@ you can pick; everything else runs inside the account resolved from
 ```bash
 mlab-cloudflare login --account <NAME|ID>
 ```
+
+## Caching
+
+Configuration reads are cached on disk under `~/.mlab/cache/cloudflare`, so the
+several commands of one audit share them — a 19-zone `dns` sweep goes from 16
+seconds to under a second on the second run. Liveness checks (`ping`, `whoami`'s
+verification, `activity`) are never cached, and neither are failures. `--no-cache`
+bypasses reads while still refreshing; `--cache-ttl 0` turns it off entirely.
 
 ## Why `whoami` comes first
 
@@ -113,8 +124,9 @@ src/
   main.rs        entry point
   cli/           the clap surface, and the context a command runs in
   commands/      one file per command
-  cf/            the HTTP client, profiles, scope resolution, redaction
+  cf/            the HTTP client, the response cache, profiles, scope, redaction
   audit.rs       the graded checks, as pure functions over fetched data
+  providers.rs   the hostname suffixes behind the takeover check
   ui/            the terminal render and the progress rules
 ```
 

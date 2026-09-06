@@ -1,5 +1,6 @@
 //! The Cloudflare side of the CLI: what to talk to, and how.
 
+pub mod cache;
 pub mod client;
 pub mod config;
 pub mod scope;

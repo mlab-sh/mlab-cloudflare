@@ -2,7 +2,6 @@
 
 use anyhow::Result;
 use clap::Args;
-use reqwest::Method;
 use serde_json::Value;
 
 use crate::cf::{esc, scope, Client};
@@ -42,14 +41,14 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &ZonesArgs) -> Result<()> {
         q.push(("status".to_string(), s.clone()));
     }
 
-    let rows = match ui::spin("Listing zones", c.list("/zones", &q, a.limit)).await {
+    let rows = match ui::spin("Listing zones", c.cached_list("/zones", &q, a.limit)).await {
         Ok(rows) => rows,
         // A zone-scoped credential is refused the listing and allowed the one
         // zone it covers, the same way `accounts` handles its own refusal.
         Err(e) if !ctx.profile.zone.is_empty() => {
             ui::info("this credential cannot list zones; reading the configured one");
             let path = format!("/zones/{}", esc(&scope::zone(c, &ctx.profile.zone).await?));
-            match c.request(Method::GET, &path, &[], None).await {
+            match c.cached(&path, &[]).await {
                 Ok(v) => vec![v],
                 Err(_) => return Err(e),
             }

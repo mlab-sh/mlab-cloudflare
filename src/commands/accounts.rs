@@ -1,7 +1,6 @@
 //! `accounts` — every account this credential reaches.
 
 use anyhow::Result;
-use reqwest::Method;
 use serde_json::Value;
 
 use crate::cf::{esc, Client};
@@ -10,7 +9,7 @@ use crate::commands::named_where;
 use crate::ui::{self, render};
 
 pub async fn run(c: &Client, ctx: &Ctx, a: &ListArgs) -> Result<()> {
-    let rows = match ui::spin("Listing accounts", c.list("/accounts", &[], a.limit)).await {
+    let rows = match ui::spin("Listing accounts", c.cached_list("/accounts", &[], a.limit)).await {
         Ok(rows) => rows,
         // A credential scoped to one account's resources — an R2 token, most
         // account-owned tokens — cannot list accounts but can usually read the
@@ -18,7 +17,7 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &ListArgs) -> Result<()> {
         Err(e) if !ctx.profile.account.is_empty() => {
             ui::info("this credential cannot list accounts; reading the configured one");
             let path = format!("/accounts/{}", esc(&ctx.profile.account));
-            match c.request(Method::GET, &path, &[], None).await {
+            match c.cached(&path, &[]).await {
                 Ok(v) => vec![v],
                 // The fallback failing says nothing new; the first refusal is
                 // the one that explains what the credential is missing.

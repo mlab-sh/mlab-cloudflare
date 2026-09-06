@@ -7,10 +7,12 @@ mod context;
 
 pub use context::{Ctx, Overrides};
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result};
 use clap::{Args, Parser, Subcommand};
 
-use crate::cf::{config, Client};
+use crate::cf::{cache, config, Client};
 use crate::commands;
 use crate::ui::{self, render};
 
@@ -70,6 +72,14 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 30, value_name = "SECS")]
     pub timeout: u64,
 
+    /// Read nothing from the cache; entries are still refreshed
+    #[arg(long, global = true)]
+    pub no_cache: bool,
+
+    /// How long a cached configuration read stays usable, in seconds
+    #[arg(long, global = true, default_value_t = cache::DEFAULT_TTL_SECS, value_name = "SECS")]
+    pub cache_ttl: u64,
+
     #[command(subcommand)]
     pub command: Cmd,
 }
@@ -92,6 +102,12 @@ pub enum Cmd {
         cmd: commands::settings::ConfigCmd,
     },
 
+    /// Inspect and empty the response cache
+    Cache {
+        #[command(subcommand)]
+        cmd: commands::cache::CacheCmd,
+    },
+
     /// Check that the current profile can reach the API
     Ping,
 
@@ -104,6 +120,18 @@ pub enum Cmd {
 
     /// Zones of the account being scanned
     Zones(commands::zones::ZonesArgs),
+
+    /// What the account's zones point at, and what points nowhere
+    Dns {
+        #[command(subcommand)]
+        cmd: Option<commands::dns::DnsCmd>,
+    },
+
+    /// What the edge is configured to do, and what is carved out of it
+    Posture {
+        #[command(subcommand)]
+        cmd: Option<commands::posture::PostureCmd>,
+    },
 
     /// Who can change this account, and with what
     #[command(alias = "iam")]
@@ -153,6 +181,7 @@ pub async fn run() -> Result<()> {
         Cmd::Login(args) => return commands::login::run(&Overrides::from(&cli), args).await,
         Cmd::Profile { cmd } => return commands::profile::run(cmd),
         Cmd::Config { cmd } => return commands::settings::run(cmd),
+        Cmd::Cache { cmd } => return commands::cache::run(cmd, Duration::from_secs(cli.cache_ttl)),
         _ => {}
     }
 
@@ -161,15 +190,23 @@ pub async fn run() -> Result<()> {
     }
 
     let ctx = Ctx::build(&cli)?;
-    let c = Client::new(&ctx.profile, ctx.timeout)
+    // A zero TTL is how the cache is turned off without deleting it: nothing is
+    // young enough to serve, so nothing is stored either.
+    let cache = (cli.cache_ttl > 0)
+        .then(|| cache::Cache::new(Duration::from_secs(cli.cache_ttl), !cli.no_cache));
+    let c = Client::with_cache(&ctx.profile, ctx.timeout, cache)
         .with_context(|| format!("profile {:?}", ctx.name))?;
 
     match cli.command {
-        Cmd::Login(_) | Cmd::Profile { .. } | Cmd::Config { .. } => unreachable!(),
+        Cmd::Login(_) | Cmd::Profile { .. } | Cmd::Config { .. } | Cmd::Cache { .. } => {
+            unreachable!()
+        }
         Cmd::Ping => commands::ping::run(&c, &ctx).await,
         Cmd::Whoami => commands::whoami::run(&c, &ctx).await,
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
+        Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Posture { cmd } => commands::posture::run(&c, &ctx, cmd).await,
         Cmd::Identity { cmd } => commands::identity::run(&c, &ctx, cmd).await,
         Cmd::Activity(a) => commands::activity::run(&c, &ctx, &a).await,
         Cmd::Api(a) => commands::api::run(&c, &ctx, a).await,

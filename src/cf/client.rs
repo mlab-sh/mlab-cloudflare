@@ -11,6 +11,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
+use crate::cf::cache::{self, Cache};
 use crate::cf::config::{Auth, Profile};
 
 /// Cap on a response body, so a misbehaving endpoint cannot exhaust memory.
@@ -87,11 +88,20 @@ pub struct Client {
     http: reqwest::Client,
     base: String,
     auth: Auth,
+    /// Absent when caching is switched off entirely.
+    cache: Option<Cache>,
+    /// A fingerprint of the credential, so two profiles never share entries.
+    tag: String,
 }
 
 impl Client {
     /// Build a client from a validated profile.
     pub fn new(profile: &Profile, timeout: Duration) -> Result<Self> {
+        Client::with_cache(profile, timeout, None)
+    }
+
+    /// The same, with an on-disk cache for the configuration reads.
+    pub fn with_cache(profile: &Profile, timeout: Duration, cache: Option<Cache>) -> Result<Self> {
         profile.validate()?;
 
         let base = std::env::var("CLOUDFLARE_API_URL")
@@ -133,11 +143,95 @@ impl Client {
             .build()
             .context("building the HTTP client")?;
 
+        // The credential itself never reaches the key; what identifies it is
+        // enough to tell two profiles apart and to miss after a rotation.
+        let tag = match profile.auth {
+            Auth::Token => profile.token.clone(),
+            Auth::Key => format!("{}:{}", profile.email, profile.api_key),
+        };
+
         Ok(Client {
             http,
             base,
             auth: profile.auth,
+            cache,
+            tag,
         })
+    }
+
+    /// A GET whose answer is configuration rather than liveness, so it may be
+    /// served from the cache.
+    ///
+    /// Deliberately a separate method from [`Client::request`]: `ping` and
+    /// `whoami` exist to say whether a credential works *now*, and a cached
+    /// answer would have them report a revoked token as active. Choosing the
+    /// cache has to be a decision at the call site, not a default the liveness
+    /// checks have to remember to opt out of.
+    pub async fn cached(&self, path: &str, query: &[(String, String)]) -> Result<Value> {
+        self.through_cache(&format!("GET {path}"), query, || {
+            self.request(Method::GET, path, query, None)
+        })
+        .await
+    }
+
+    /// A cached collection, stored assembled rather than page by page.
+    pub async fn cached_list(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        limit: Option<u32>,
+    ) -> Result<Vec<Value>> {
+        let v = self
+            .through_cache(&format!("LIST {path}"), query, || async {
+                Ok(Value::Array(self.list(path, query, limit).await?))
+            })
+            .await?;
+        Ok(array_of(&v))
+    }
+
+    /// A cached cursor-paginated collection.
+    pub async fn cached_list_cursor(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        limit: Option<u32>,
+    ) -> Result<Vec<Value>> {
+        let v = self
+            .through_cache(&format!("CURSOR {path}"), query, || async {
+                Ok(Value::Array(self.list_cursor(path, query, limit).await?))
+            })
+            .await?;
+        Ok(array_of(&v))
+    }
+
+    /// Serve `label` + `query` from the cache, or run `fetch` and store it.
+    async fn through_cache<F, Fut>(
+        &self,
+        label: &str,
+        query: &[(String, String)],
+        fetch: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        let Some(cache) = &self.cache else {
+            return fetch().await;
+        };
+        // The query is part of what was asked for, so it is part of the key;
+        // sorted, because two calls that differ only in argument order are the
+        // same request.
+        let mut parts: Vec<String> = query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        parts.sort();
+        let request = format!("{label} {}", parts.join("&"));
+        let key = cache::key(&self.tag, &request);
+
+        if let Some(hit) = cache.get(&key) {
+            return Ok(hit);
+        }
+        let fresh = fetch().await?;
+        cache.put(&key, request.trim(), &fresh);
+        Ok(fresh)
     }
 
     pub fn auth(&self) -> Auth {

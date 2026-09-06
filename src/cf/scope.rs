@@ -17,9 +17,12 @@ pub async fn account(c: &Client, want: &str) -> Result<String> {
         return Ok(want.to_string());
     }
 
-    let accounts = ui::spin("Resolving the account", c.list("/accounts", &[], None))
-        .await
-        .context("listing accounts")?;
+    let accounts = ui::spin(
+        "Resolving the account",
+        c.cached_list("/accounts", &[], None),
+    )
+    .await
+    .context("listing accounts")?;
     let names = || {
         accounts
             .iter()
@@ -66,7 +69,7 @@ pub async fn zone(c: &Client, want: &str) -> Result<String> {
     }
 
     let q = vec![("name".to_string(), want.to_ascii_lowercase())];
-    let found = ui::spin("Resolving the zone", c.list("/zones", &q, None))
+    let found = ui::spin("Resolving the zone", c.cached_list("/zones", &q, None))
         .await
         .context("looking up the zone")?;
 

@@ -5,6 +5,8 @@
 
 **Commands**
 - [whoami](Whoami)
+- [dns](Dns)
+- [posture](Posture)
 - [identity](Identity)
 - [activity](Activity)
 - [login](Login)
@@ -14,12 +16,14 @@
 - [api](Api)
 - [profile](Configuration)
 - [config](Configuration)
+- [cache](Cache)
 
 **Concepts**
 - [Tokens](Tokens)
 - [Configuration](Configuration)
 - [Output](Output)
 - [Errors](Errors)
+- [Cache](Cache)
 
 **Security**
 - [Secrets](Secrets)

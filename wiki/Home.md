@@ -21,11 +21,14 @@ unless a command says it does and you pass the flag that allows it.
 | [`ping`](Ping) | Check that the current profile reaches the API. |
 | [`accounts`](Accounts) | Accounts this credential reaches. |
 | [`zones`](Zones) | Zones of the account being scanned, and which of them enforce nothing. |
+| [`dns`](Dns) | What the zones point at, and what points nowhere. Graded. |
+| [`posture`](Posture) | What the edge enforces, and what is carved out of it. Graded. |
 | [`identity`](Identity) | Who can change this account, and with what. Graded. |
 | [`activity`](Activity) | What was actually done to this account, and by whom. |
 | [`api`](Api) | Raw request against any endpoint, for everything not wrapped yet. |
 | [`profile`](Configuration) | List, show, select and delete saved profiles. |
 | [`config`](Configuration) | Where the config file is, and what is in it. |
+| [`cache`](Cache) | What the response cache holds, and how to empty it. |
 
 ## One account at a time
 
@@ -48,6 +51,8 @@ nothing asks again.
   environment and file, and where credentials live.
 - **[Output](Output)** — a terminal render by default, raw JSON with `-o json`,
   and the rules that keep the two from mixing.
+- **[Cache](Cache)** — configuration reads are cached on disk so the several
+  commands of one audit share them. What is never cached, and why.
 - **[Errors](Errors)** — the envelope, the three meanings of `403`, the rate
   ceiling, and what the tool retries on your behalf.
 - **[Secrets](Secrets)** — several readable endpoints hand back live
