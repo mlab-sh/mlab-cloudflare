@@ -7,6 +7,7 @@
 - [whoami](Whoami)
 - [dns](Dns)
 - [posture](Posture)
+- [tls](Tls)
 - [identity](Identity)
 - [activity](Activity)
 - [login](Login)

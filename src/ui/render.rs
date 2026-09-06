@@ -148,6 +148,41 @@ pub const EDGE_COLS: &[Col] = &[
     Col("TARGET", &["target"]),
 ];
 
+/// Whether the origin will talk to anyone who finds its address.
+pub const ORIGIN_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("SSL", &["ssl"]),
+    Col("ORIGIN PULLS", &["originPulls"]),
+    Col("PUBLISHED", &["published"]),
+    Col("ORIGIN", &["exposure"]),
+];
+
+pub const CERT_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("HOSTS", &["hosts"]),
+    Col("ISSUER", &["issuer"]),
+    Col("SIGNATURE", &["signature"]),
+    Col("STATUS", &["status"]),
+    Col("EXPIRES", &["expires"]),
+];
+
+pub const ACCOUNT_CERT_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("TYPE", &["type"]),
+    Col("ISSUER", &["issuer"]),
+    Col("CA", &["ca"]),
+    Col("EXPIRES", &["expires"]),
+];
+
+pub const HOSTNAME_COLS: &[Col] = &[
+    Col("ZONE", &["zone"]),
+    Col("KIND", &["kind"]),
+    Col("NAME", &["name"]),
+    Col("STATUS", &["status"]),
+    Col("SSL", &["ssl"]),
+    Col("EXPIRES", &["expires"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),
@@ -587,7 +622,9 @@ fn tint(s: &str) -> colored::ColoredString {
         "allow" | "read" | "-all" | "p=reject" => s.green(),
         "deny" | "block" | "failed" | "write" | "+all" | "?all" | "flexible"
         | "essentially_off" => s.red(),
-        "skip" | "log" | "full" | "1.0" | "1.1" => s.yellow(),
+        "skip" | "log" | "full" | "1.0" | "1.1" | "pending_validation" => s.yellow(),
+        "reachable" => s.red().bold(),
+        "not readable" => s.dimmed(),
         "strict" | "managed_challenge" | "challenge" | "1.2" | "1.3" => s.green(),
         "~all" | "p=quarantine" | "p=none" | "set" => s.yellow(),
         "" => s.normal(),

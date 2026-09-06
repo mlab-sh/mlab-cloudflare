@@ -63,11 +63,19 @@ over fetched data) plus the two commands that use it.
   rate-limit phases, and reporting that as unconfigured would have produced 36
   false findings on a 19-zone account
 
-## Phase 5 — certificates and origin trust
+## Phase 5 — certificates and origin trust — **done**
 
-Small, and it turns a DNS finding into an exposure: without Authenticated
-Origin Pulls, every leaked origin address is a way in rather than an
-information disclosure. Plus the certificate inventory and its expiries.
+[`tls`](Tls), with `origin`, `certs` and `hostnames`.
+
+- The composite finding the plane exists for: an origin published in DNS *and*
+  Authenticated Origin Pulls off, which is what turns an address from an
+  information disclosure into a way in. Both planes share one implementation of
+  "which records publish an origin", so they cannot disagree
+- Origin pulls on with hostnames excluded, where the zone reads as covered
+- Certificate expiry in two tiers, packs stalled before active, client
+  certificates with no end date, certificate transparency unwatched
+- The Gateway CA on its own clock, since replacing it is a fleet rollout
+- A refused read is reported neither way — `None` is not evidence
 
 ## Phase 6 — the developer platform
 

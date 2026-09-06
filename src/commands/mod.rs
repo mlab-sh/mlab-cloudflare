@@ -16,6 +16,7 @@ pub mod posture;
 pub mod profile;
 pub mod prompt;
 pub mod settings;
+pub mod tls;
 pub mod whoami;
 pub mod zones;
 

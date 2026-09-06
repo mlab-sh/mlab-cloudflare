@@ -602,18 +602,43 @@ impl Zone {
             .iter()
             .filter(move |r| kinds.contains(&str_of(r, "type").as_str()))
     }
+}
 
-    /// The addresses Cloudflare proxies for, which is to say the origins.
-    ///
-    /// A proxied record still reports its real target in `content`; the proxy
-    /// hides it from a resolver, not from the API.
-    fn proxied_origins(&self) -> BTreeSet<String> {
-        self.of_type(&["A", "AAAA"])
-            .filter(|r| r.get("proxied").and_then(Value::as_bool) == Some(true))
-            .map(|r| str_of(r, "content"))
-            .filter(|c| !is_placeholder(c))
-            .collect()
-    }
+/// The addresses Cloudflare proxies for, which is to say the origins.
+///
+/// A proxied record still reports its real target in `content`; the proxy hides
+/// it from a resolver, not from the API.
+fn proxied_origins(records: &[Value]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|r| {
+            matches!(str_of(r, "type").as_str(), "A" | "AAAA")
+                && r.get("proxied").and_then(Value::as_bool) == Some(true)
+        })
+        .map(|r| str_of(r, "content"))
+        .filter(|c| !is_placeholder(c))
+        .collect()
+}
+
+/// The records that publish an address Cloudflare also fronts for, as
+/// `name → address`.
+///
+/// Public because the certificate plane asks the same question of the same
+/// records — an origin published in DNS is only an exposure when the origin
+/// also accepts connections that did not come through Cloudflare — and two
+/// implementations of one question would eventually disagree.
+pub fn published_origins(records: &[Value]) -> Vec<String> {
+    let origins = proxied_origins(records);
+    records
+        .iter()
+        .filter(|r| {
+            matches!(str_of(r, "type").as_str(), "A" | "AAAA")
+                && r.get("proxied").and_then(Value::as_bool) != Some(true)
+                && r.get("proxiable").and_then(Value::as_bool) != Some(false)
+                && origins.contains(&str_of(r, "content"))
+        })
+        .map(|r| format!("{} → {}", str_of(r, "name"), str_of(r, "content")))
+        .collect()
 }
 
 /// A record that resolves to nothing on purpose.
@@ -753,27 +778,22 @@ pub fn exposure(zones: &[Zone]) -> Vec<Finding> {
     let mut wildcards = Vec::new();
 
     for z in zones {
-        let origins = z.proxied_origins();
+        leaks.extend(published_origins(&z.records));
         for r in z.of_type(&["A", "AAAA"]) {
             let name = str_of(r, "name");
             let content = str_of(r, "content");
-            let proxied = r.get("proxied").and_then(Value::as_bool) == Some(true);
 
             if is_private(&content) {
                 private.push(format!("{name} → {content}"));
                 continue;
             }
-            if proxied || is_placeholder(&content) {
+            if r.get("proxied").and_then(Value::as_bool) == Some(true)
+                || is_placeholder(&content)
+                || r.get("proxiable").and_then(Value::as_bool) == Some(false)
+            {
                 continue;
             }
-            // Only records Cloudflare could proxy: an unproxiable one is not a
-            // choice anybody made.
-            if r.get("proxiable").and_then(Value::as_bool) == Some(false) {
-                continue;
-            }
-            if origins.contains(&content) {
-                leaks.push(format!("{name} → {content}"));
-            } else {
+            if !proxied_origins(&z.records).contains(&content) {
                 plain.push(format!("{name} → {content}"));
             }
         }
@@ -1821,6 +1841,406 @@ fn port_of(protocol: &str) -> Option<u16> {
     protocol.rsplit('/').next()?.split('-').next()?.parse().ok()
 }
 
+// ---- certificates and origin trust -----------------------------------------
+
+/// One zone's certificate posture and what its origin will accept.
+pub struct Tls {
+    pub name: String,
+    /// From the settings blob, so the two planes agree on what mode is set.
+    pub ssl_mode: String,
+    /// `None` when the setting could not be read, which is not the same as off.
+    pub aop: Option<bool>,
+    pub aop_hostnames: Vec<Value>,
+    pub universal: Option<Value>,
+    pub packs: Vec<Value>,
+    pub custom_certs: Vec<Value>,
+    pub custom_hostnames: Vec<Value>,
+    pub client_certs: Vec<Value>,
+    pub ct_alerting: Option<Value>,
+    /// `name → address` for every record that publishes an address the proxy
+    /// also fronts for, from [`published_origins`].
+    pub exposed_origins: Vec<String>,
+}
+
+impl Tls {
+    fn aop_off(&self) -> bool {
+        self.aop == Some(false)
+    }
+}
+
+/// Whether the origin will talk to anyone who finds its address.
+///
+/// This is the plane's whole argument. Encrypting the origin leg protects the
+/// transport; it does nothing about who may open the connection. Authenticated
+/// Origin Pulls is the control that makes the origin refuse a request that did
+/// not come through Cloudflare, and without it every address the DNS plane
+/// found published is a way in rather than an information disclosure.
+pub fn origin_trust(zones: &[Tls]) -> Vec<Finding> {
+    let mut chained = Vec::new();
+    let mut unguarded = Vec::new();
+    let mut partial = Vec::new();
+    let mut no_universal = Vec::new();
+
+    for z in zones {
+        if z.aop_off() {
+            if z.exposed_origins.is_empty() {
+                unguarded.push(z.name.clone());
+            } else {
+                // The complete chain: the address is published, and the origin
+                // does not check who is calling.
+                chained.push(format!(
+                    "{} ({} published, ssl {})",
+                    z.name,
+                    z.exposed_origins.len(),
+                    if z.ssl_mode.is_empty() {
+                        "unknown"
+                    } else {
+                        &z.ssl_mode
+                    }
+                ));
+            }
+        }
+
+        // Enabled zone-wide, and off for particular hostnames: the gap is the
+        // finding, because the zone reads as covered.
+        if z.aop == Some(true) {
+            let gaps: Vec<String> = z
+                .aop_hostnames
+                .iter()
+                .filter(|h| h.get("enabled").and_then(Value::as_bool) == Some(false))
+                .map(|h| str_of(h, "hostname"))
+                .collect();
+            if !gaps.is_empty() {
+                partial.push(format!("{}: {}", z.name, gaps.join(", ")));
+            }
+        }
+
+        // Universal SSL off with nothing uploaded means the hostnames covered
+        // by neither are served no certificate at all.
+        if z.universal
+            .as_ref()
+            .and_then(|u| u.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+            && z.custom_certs.is_empty()
+        {
+            no_universal.push(z.name.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "origin", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} {} an origin address in DNS and {} require Cloudflare's client certificate \
+             at the origin, so that address is a way in rather than an information \
+             disclosure",
+            chained.len(),
+            agree(chained.len(), "zone publishes", "zones publish"),
+            agree(chained.len(), "does not", "do not")
+        ),
+        chained.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} Authenticated Origin Pulls off, so nothing at the origin distinguishes \
+             Cloudflare from anyone else who learns the address",
+            unguarded.len(),
+            agree(unguarded.len(), "zone has", "zones have")
+        ),
+        unguarded.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} Authenticated Origin Pulls on with hostnames excluded from it",
+            partial.len(),
+            agree(partial.len(), "zone has", "zones have")
+        ),
+        partial.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} Universal SSL off and no certificate uploaded",
+            no_universal.len(),
+            agree(no_universal.len(), "zone has", "zones have")
+        ),
+        no_universal.clone(),
+    );
+    out
+}
+
+/// The certificate inventory: what expires, and what never finished issuing.
+pub fn certificates(zones: &[Tls], soon_days: i64) -> Vec<Finding> {
+    let mut imminent = Vec::new();
+    let mut expiring = Vec::new();
+    let mut stalled = Vec::new();
+    let mut client_forever = Vec::new();
+    let mut no_ct = Vec::new();
+
+    for z in zones {
+        // A pack holds one certificate per signature algorithm, and each
+        // carries its own expiry.
+        for pack in &z.packs {
+            let status = str_of(pack, "status");
+            if !status.is_empty() && status != "active" {
+                stalled.push(format!(
+                    "{}: {} ({status})",
+                    z.name,
+                    hosts_of(pack).unwrap_or_else(|| str_of(pack, "id"))
+                ));
+            }
+            for cert in pack
+                .get("certificates")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                note_expiry(&z.name, cert, soon_days, &mut imminent, &mut expiring);
+            }
+        }
+        for cert in &z.custom_certs {
+            note_expiry(&z.name, cert, soon_days, &mut imminent, &mut expiring);
+        }
+
+        for c in &z.client_certs {
+            let name = str_of(c, "common_name");
+            match days_until(&str_of(c, "expires_on")) {
+                None => client_forever.push(format!("{}: {name}", z.name)),
+                Some(d) if d <= soon_days => {
+                    expiring.push(format!("{}: client certificate {name} in {d}d", z.name))
+                }
+                Some(_) => {}
+            }
+        }
+
+        // Nobody watching means a certificate issued for the domain by anyone
+        // else goes unnoticed.
+        if z.ct_alerting
+            .as_ref()
+            .and_then(|c| c.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            no_ct.push(z.name.clone());
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "certificates", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} {} within two weeks",
+            imminent.len(),
+            agree(imminent.len(), "certificate expires", "certificates expire")
+        ),
+        imminent.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} within {soon_days} days",
+            expiring.len(),
+            agree(expiring.len(), "certificate expires", "certificates expire")
+        ),
+        expiring.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} certificate {} never reached active, so the hostnames it covers are not \
+             served by it",
+            stalled.len(),
+            agree(stalled.len(), "pack", "packs")
+        ),
+        stalled.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} client {} no expiry, which makes it an unrotatable credential outside the \
+             token system",
+            client_forever.len(),
+            agree(client_forever.len(), "certificate has", "certificates have")
+        ),
+        client_forever.clone(),
+    );
+    push(
+        Severity::Low,
+        format!(
+            "{} {} nobody subscribed to certificate transparency alerts, so a certificate \
+             issued for the domain by anyone else goes unnoticed",
+            no_ct.len(),
+            agree(no_ct.len(), "zone has", "zones have")
+        ),
+        no_ct.clone(),
+    );
+    out
+}
+
+/// Customer hostnames on a SaaS zone, which is a tenant list.
+pub fn hostnames(zones: &[Tls]) -> Vec<Finding> {
+    let mut unverified = Vec::new();
+    let mut custom_origin = Vec::new();
+
+    for z in zones {
+        for h in &z.custom_hostnames {
+            let name = str_of(h, "hostname");
+            let status = str_of(h, "status");
+            let ssl = h
+                .get("ssl")
+                .map(|s| str_of(s, "status"))
+                .unwrap_or_default();
+            if (!status.is_empty() && status != "active") || (!ssl.is_empty() && ssl != "active") {
+                unverified.push(format!("{}: {name} ({status}, ssl {ssl})", z.name));
+            }
+            if let Some(origin) = h.get("custom_origin_server").and_then(Value::as_str) {
+                if !origin.is_empty() {
+                    custom_origin.push(format!("{name} → {origin}"));
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if !unverified.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "hostnames",
+                format!(
+                    "{} customer {} never finished verification, which is the same dangling \
+                     shape as a stale DNS record with the zone owner serving it",
+                    unverified.len(),
+                    agree(unverified.len(), "hostname", "hostnames")
+                ),
+            )
+            .with(unverified.join("; ")),
+        );
+    }
+    if !custom_origin.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Info,
+                "hostnames",
+                format!(
+                    "{} customer {} at an origin of its own",
+                    custom_origin.len(),
+                    agree(custom_origin.len(), "hostname points", "hostnames point")
+                ),
+            )
+            .with(custom_origin.join(", ")),
+        );
+    }
+    out
+}
+
+/// Account-level mTLS certificates, which several products draw from.
+pub fn account_certificates(certs: &[Value], soon_days: i64) -> Vec<Finding> {
+    let mut expiring = Vec::new();
+    let mut fleet = Vec::new();
+
+    for c in certs {
+        let name = str_of(c, "name");
+        let Some(days) = days_until(&str_of(c, "expires_on")) else {
+            continue;
+        };
+        // The Gateway CA is installed on every managed device; its expiry is a
+        // fleet-wide outage with a date on it, and it wants a year of warning
+        // rather than a month.
+        if str_of(c, "type") == "gateway_managed" {
+            if days <= 365 {
+                fleet.push(format!("{name} in {days}d"));
+            }
+        } else if days <= soon_days {
+            expiring.push(format!("{name} in {days}d"));
+        }
+    }
+
+    let mut out = Vec::new();
+    if !fleet.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::High,
+                "certificates",
+                format!(
+                    "{} Gateway {} within a year; it is trusted by every managed device, so \
+                     its expiry is a fleet-wide outage with a date on it",
+                    fleet.len(),
+                    agree(fleet.len(), "CA expires", "CAs expire")
+                ),
+            )
+            .with(fleet.join(", ")),
+        );
+    }
+    if !expiring.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "certificates",
+                format!(
+                    "{} account mTLS {} within {soon_days} days",
+                    expiring.len(),
+                    agree(expiring.len(), "certificate expires", "certificates expire")
+                ),
+            )
+            .with(expiring.join(", ")),
+        );
+    }
+    out
+}
+
+/// Sort one certificate into the right expiry bucket.
+///
+/// Two weeks is the line: inside it there is no time for a renewal that needs a
+/// DNS change or a purchase, and the finding has to outrank the rest of the
+/// report.
+fn note_expiry(
+    zone: &str,
+    cert: &Value,
+    soon_days: i64,
+    imminent: &mut Vec<String>,
+    expiring: &mut Vec<String>,
+) {
+    let Some(days) = days_until(&str_of(cert, "expires_on")) else {
+        return;
+    };
+    let hosts = hosts_of(cert).unwrap_or_else(|| str_of(cert, "id"));
+    let line = format!("{zone}: {hosts} in {days}d");
+    if days <= 14 {
+        imminent.push(line);
+    } else if days <= soon_days {
+        expiring.push(line);
+    }
+}
+
+/// The hostnames a certificate covers, shortened to the first few.
+fn hosts_of(v: &Value) -> Option<String> {
+    let hosts = v.get("hosts")?.as_array()?;
+    let names: Vec<&str> = hosts.iter().filter_map(Value::as_str).collect();
+    if names.is_empty() {
+        return None;
+    }
+    Some(match names.len() {
+        1..=2 => names.join(", "),
+        n => format!("{}, +{} more", names[..2].join(", "), n - 2),
+    })
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -2834,6 +3254,215 @@ mod tests {
             "a range is judged by its start"
         );
         assert_eq!(port_of("nonsense"), None);
+    }
+
+    // ---- certificates and origin trust --------------------------------------
+
+    fn tls(name: &str, aop: Option<bool>) -> Tls {
+        Tls {
+            name: name.to_string(),
+            ssl_mode: "strict".into(),
+            aop,
+            aop_hostnames: vec![],
+            universal: None,
+            packs: vec![],
+            custom_certs: vec![],
+            custom_hostnames: vec![],
+            client_certs: vec![],
+            ct_alerting: None,
+            exposed_origins: vec![],
+        }
+    }
+
+    /// Days from now as the API would print the instant.
+    fn in_days(d: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        crate::cf::iso8601(now + d * 86_400)
+    }
+
+    #[test]
+    fn a_published_origin_becomes_an_exposure_only_when_the_origin_does_not_check() {
+        // The whole argument of the plane, in one test.
+        let mut exposed = tls("open.test", Some(false));
+        exposed.exposed_origins = vec!["direct.open.test → 198.18.0.9".into()];
+        let f = origin_trust(&[exposed]);
+        assert_eq!(
+            at(&f, "way in rather than an information disclosure"),
+            Severity::High
+        );
+
+        // Same records, origin pulls on: the address is disclosed and not usable.
+        let mut guarded = tls("closed.test", Some(true));
+        guarded.exposed_origins = vec!["direct.closed.test → 198.18.0.9".into()];
+        assert!(origin_trust(&[guarded]).is_empty());
+
+        // Origin pulls off and nothing published: worth saying, one grade down.
+        assert_eq!(
+            at(
+                &origin_trust(&[tls("quiet.test", Some(false))]),
+                "distinguishes Cloudflare"
+            ),
+            Severity::Medium
+        );
+    }
+
+    #[test]
+    fn a_setting_that_could_not_be_read_is_not_reported_as_off() {
+        // `None` is a refused read, which is not evidence that the control is
+        // missing — and this is the plane's headline finding, so guessing here
+        // would be the worst place to guess.
+        assert!(origin_trust(&[tls("unknown.test", None)]).is_empty());
+    }
+
+    #[test]
+    fn origin_pulls_on_with_hostnames_excluded_is_its_own_finding() {
+        // The zone reads as covered, and the gap is what matters.
+        let mut z = tls("a.test", Some(true));
+        z.aop_hostnames = vec![
+            json!({"hostname": "api.a.test", "enabled": false}),
+            json!({"hostname": "www.a.test", "enabled": true}),
+        ];
+        let f = origin_trust(&[z]);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("hostnames excluded"))
+            .unwrap();
+        assert!(hit.detail.contains("api.a.test"));
+        assert!(!hit.detail.contains("www.a.test"));
+    }
+
+    #[test]
+    fn a_certificate_inside_two_weeks_outranks_one_inside_a_month() {
+        // Inside two weeks there is no time for a renewal that needs a DNS
+        // change or a purchase.
+        let mut z = tls("a.test", Some(true));
+        z.packs = vec![json!({
+            "status": "active",
+            "hosts": ["a.test"],
+            "certificates": [
+                {"id": "c1", "hosts": ["a.test"], "expires_on": in_days(9)},
+                {"id": "c2", "hosts": ["www.a.test"], "expires_on": in_days(25)},
+                {"id": "c3", "hosts": ["far.a.test"], "expires_on": in_days(200)},
+            ]
+        })];
+        let f = certificates(&[z], 30);
+        assert_eq!(at(&f, "within two weeks"), Severity::High);
+        assert_eq!(at(&f, "within 30 days"), Severity::Medium);
+        assert!(
+            f.iter().all(|f| !f.detail.contains("far.a.test")),
+            "a distant expiry is not a finding"
+        );
+    }
+
+    #[test]
+    fn a_pack_that_never_reached_active_is_reported_with_its_state() {
+        let mut z = tls("a.test", Some(true));
+        z.packs = vec![json!({
+            "id": "p1", "status": "pending_validation", "hosts": ["a.test", "www.a.test"],
+            "certificates": []
+        })];
+        let f = certificates(&[z], 30);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("never reached active"))
+            .unwrap();
+        assert!(hit.detail.contains("pending_validation"), "{}", hit.detail);
+        assert!(hit.detail.contains("a.test"));
+    }
+
+    #[test]
+    fn a_client_certificate_with_no_end_date_is_an_unrotatable_credential() {
+        let mut z = tls("a.test", Some(true));
+        z.client_certs = vec![json!({"common_name": "partner", "expires_on": ""})];
+        assert_eq!(
+            at(&certificates(&[z], 30), "unrotatable credential"),
+            Severity::Medium
+        );
+    }
+
+    #[test]
+    fn the_gateway_ca_gets_a_year_of_warning_rather_than_a_month() {
+        // It is trusted by every managed device, so replacing it is a fleet
+        // rollout rather than a certificate renewal.
+        let ca = vec![json!({
+            "name": "Gateway CA", "type": "gateway_managed", "expires_on": in_days(200)
+        })];
+        assert_eq!(
+            at(&account_certificates(&ca, 30), "fleet-wide outage"),
+            Severity::High
+        );
+
+        // An ordinary account certificate at the same distance is not due yet.
+        let other =
+            vec![json!({"name": "partner mTLS", "type": "custom", "expires_on": in_days(200)})];
+        assert!(account_certificates(&other, 30).is_empty());
+    }
+
+    #[test]
+    fn a_customer_hostname_that_never_verified_is_the_dangling_shape() {
+        let mut z = tls("saas.test", Some(true));
+        z.custom_hostnames = vec![
+            json!({"hostname": "gone.customer.test", "status": "pending",
+                   "ssl": {"status": "pending_validation"}}),
+            json!({"hostname": "live.customer.test", "status": "active",
+                   "ssl": {"status": "active"}}),
+        ];
+        let f = hostnames(&[z]);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("never finished verification"))
+            .unwrap();
+        assert!(hit.detail.contains("gone.customer.test"));
+        assert!(!hit.detail.contains("live.customer.test"));
+    }
+
+    #[test]
+    fn certificate_transparency_is_only_reported_where_the_answer_was_read() {
+        let mut off = tls("a.test", Some(true));
+        off.ct_alerting = Some(json!({"enabled": false}));
+        assert_eq!(
+            at(&certificates(&[off], 30), "certificate transparency"),
+            Severity::Low
+        );
+
+        let mut on = tls("b.test", Some(true));
+        on.ct_alerting = Some(json!({"enabled": true, "emails": ["a@b.test"]}));
+        assert!(!has(&certificates(&[on], 30), "certificate transparency"));
+
+        // Unreadable: no claim either way.
+        assert!(!has(
+            &certificates(&[tls("c.test", Some(true))], 30),
+            "certificate transparency"
+        ));
+    }
+
+    #[test]
+    fn covered_hostnames_are_summarized_rather_than_listed_in_full() {
+        // A pack can cover dozens; the finding has to stay one line.
+        assert_eq!(hosts_of(&json!({"hosts": ["a.test"]})).unwrap(), "a.test");
+        assert_eq!(
+            hosts_of(&json!({"hosts": ["a.test", "b.test", "c.test", "d.test"]})).unwrap(),
+            "a.test, b.test, +2 more"
+        );
+        assert!(hosts_of(&json!({"hosts": []})).is_none());
+    }
+
+    #[test]
+    fn the_two_planes_agree_on_which_records_publish_an_origin() {
+        // `exposure` and the certificate plane ask the same question, so they
+        // share the answer rather than each computing one.
+        let records = vec![
+            rec("www.a.test", "A", "198.18.0.9", Some(true)),
+            rec("direct.a.test", "A", "198.18.0.9", Some(false)),
+            rec("other.a.test", "A", "198.18.0.10", Some(false)),
+        ];
+        assert_eq!(
+            published_origins(&records),
+            vec!["direct.a.test → 198.18.0.9"]
+        );
     }
 
     // ---- ordering -----------------------------------------------------------

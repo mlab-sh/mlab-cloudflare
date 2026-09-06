@@ -127,6 +127,12 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// What browsers are served, and whether the origin will talk to anyone
+    Tls {
+        #[command(subcommand)]
+        cmd: Option<commands::tls::TlsCmd>,
+    },
+
     /// What the edge is configured to do, and what is carved out of it
     Posture {
         #[command(subcommand)]
@@ -206,6 +212,7 @@ pub async fn run() -> Result<()> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Tls { cmd } => commands::tls::run(&c, &ctx, cmd).await,
         Cmd::Posture { cmd } => commands::posture::run(&c, &ctx, cmd).await,
         Cmd::Identity { cmd } => commands::identity::run(&c, &ctx, cmd).await,
         Cmd::Activity(a) => commands::activity::run(&c, &ctx, &a).await,
