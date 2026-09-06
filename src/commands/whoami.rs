@@ -32,13 +32,15 @@ async fn report_token(c: &Client, ctx: &Ctx) -> Result<()> {
     // which a well-scoped audit token deliberately does not have. Not knowing
     // the policies is a normal outcome, not a failure — and the path differs
     // per store, so it is asked for rather than built here.
+    // Cached: a token's policies are configuration. The verification above is
+    // the liveness half of this command and is never served from the cache, so
+    // a revoked token is still reported as revoked.
     let detail = match token::detail_path(owner, &ctx.profile.account, &id) {
-        Some(path) if !id.is_empty() => ui::spin(
-            "Reading the token policies",
-            c.request(Method::GET, &path, &[], None),
-        )
-        .await
-        .ok(),
+        Some(path) if !id.is_empty() => {
+            ui::spin("Reading the token policies", c.cached(&path, &[]))
+                .await
+                .ok()
+        }
         _ => None,
     };
 

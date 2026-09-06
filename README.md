@@ -87,10 +87,17 @@ mlab-cloudflare login --account <NAME|ID>
 ## Caching
 
 Configuration reads are cached on disk under `~/.mlab/cache/cloudflare`, so the
-several commands of one audit share them — a 19-zone `dns` sweep goes from 16
-seconds to under a second on the second run. Liveness checks (`ping`, `whoami`'s
-verification, `activity`) are never cached, and neither are failures. `--no-cache`
-bypasses reads while still refreshing; `--cache-ttl 0` turns it off entirely.
+several commands of one audit share them. `dns`, `posture`, `tls` and `identity`
+over a 19-zone account are 54 seconds cold and under a second warm.
+
+Refusals are remembered too, which is most of that: a free zone answering `404`
+on a phase its plan does not have is a fact rather than a moment, and re-asking
+it on every zone on every run was the entire warm cost. A `429` and any `5xx`
+are never stored.
+
+Liveness checks — `ping`, `whoami`'s verification, `activity` — are never cached.
+`--no-cache` bypasses reads while still refreshing; `--cache-ttl 0` turns it off
+entirely.
 
 ## Why `whoami` comes first
 

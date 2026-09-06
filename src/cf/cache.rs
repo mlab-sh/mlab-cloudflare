@@ -6,7 +6,7 @@
 //! takeover` fetches the same records three times over. Configuration does not
 //! change between those, so it is read once.
 //!
-//! Two rules decide what may be cached, and both are about not lying:
+//! Three rules decide what may be cached, and all three are about not lying:
 //!
 //! 1. **Only configuration, never liveness.** `ping` and `whoami` exist to say
 //!    whether a credential works *now*; a cached answer would make them report
@@ -15,6 +15,11 @@
 //! 2. **Keyed by credential.** Two profiles with different scopes see different
 //!    answers to the same request, so the credential is part of the key. A
 //!    rotated token therefore misses on everything, which is correct.
+//! 3. **A refusal is a fact too, unless it is about the moment.** Roughly a
+//!    quarter of the reads in a full audit are refused — a free zone has no
+//!    entry point for a phase its plan excludes, a scoped token cannot list
+//!    tokens — and re-asking those was the entire cost of a second run. They
+//!    are stored and replayed. A `429` and any `5xx` never are.
 //!
 //! Entries hold whatever the API returned, and some of that is a live secret —
 //! a tunnel's connector token, a Turnstile widget's key. The directory is
@@ -34,6 +39,21 @@ use serde_json::Value;
 /// during the audit is picked up by the next one.
 pub const DEFAULT_TTL_SECS: u64 = 900;
 
+/// A refusal, kept so it can be replayed rather than re-asked.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Refusal {
+    pub status: u16,
+    pub code: i64,
+    pub message: String,
+}
+
+/// What a lookup found.
+pub enum Hit {
+    Body(Value),
+    /// The endpoint refused, and said so within the TTL.
+    Refused(Refusal),
+}
+
 /// One stored response.
 #[derive(Serialize, Deserialize)]
 struct Entry {
@@ -43,7 +63,17 @@ struct Entry {
     /// What was asked for, so `cache status` can say what is held. Ids are not
     /// secrets; the values under them may be, which is what the mode is for.
     request: String,
-    body: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<Value>,
+    /// Set instead of `body` when the endpoint refused.
+    ///
+    /// Worth remembering because most refusals here are facts about a plan or a
+    /// token rather than about a moment: a free zone will still answer `404` on
+    /// the managed-ruleset phase in a second, and a scan that re-asks pays for
+    /// that answer on every zone, every run. Before this, the second run of
+    /// `posture` cost the same as the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refusal: Option<Refusal>,
 }
 
 /// A configured cache directory.
@@ -64,11 +94,11 @@ impl Cache {
         }
     }
 
-    /// The stored body for `key`, if it is present and young enough.
+    /// What is stored for `key`, if it is present and young enough.
     ///
     /// Every failure here is a miss rather than an error: a cache that can
     /// break a command is worse than no cache.
-    pub fn get(&self, key: &str) -> Option<Value> {
+    pub fn get(&self, key: &str) -> Option<Hit> {
         if !self.read {
             return None;
         }
@@ -76,15 +106,32 @@ impl Cache {
         // Strictly younger than the TTL, so `--cache-ttl 0` means no cache at
         // all rather than "one second of cache".
         let age = now().checked_sub(entry.fetched_at)?;
-        (age < self.ttl.as_secs()).then_some(entry.body)
+        if age >= self.ttl.as_secs() {
+            return None;
+        }
+        match (entry.body, entry.refusal) {
+            (Some(body), _) => Some(Hit::Body(body)),
+            (None, Some(r)) => Some(Hit::Refused(r)),
+            (None, None) => None,
+        }
     }
 
     /// Store a response. A write failure is ignored for the same reason.
     pub fn put(&self, key: &str, request: &str, body: &Value) {
+        self.write(key, request, Some(body.clone()), None);
+    }
+
+    /// Store a refusal, to be replayed rather than re-asked.
+    pub fn put_refusal(&self, key: &str, request: &str, refusal: Refusal) {
+        self.write(key, request, None, Some(refusal));
+    }
+
+    fn write(&self, key: &str, request: &str, body: Option<Value>, refusal: Option<Refusal>) {
         let entry = Entry {
             fetched_at: now(),
             request: request.to_string(),
-            body: body.clone(),
+            body,
+            refusal,
         };
         let Ok(data) = serde_json::to_vec(&entry) else {
             return;
@@ -119,8 +166,8 @@ impl Cache {
         Ok(n)
     }
 
-    /// What is held: one row per entry, newest first.
-    pub fn entries(&self) -> Vec<(String, u64, u64)> {
+    /// What is held: request, age in seconds, size, and whether it is a refusal.
+    pub fn entries(&self) -> Vec<(String, u64, u64, bool)> {
         let mut out = Vec::new();
         let Ok(dir) = fs::read_dir(&self.dir) else {
             return out;
@@ -131,10 +178,15 @@ impl Cache {
             };
             let size = data.len() as u64;
             if let Ok(entry) = serde_json::from_slice::<Entry>(&data) {
-                out.push((entry.request, now().saturating_sub(entry.fetched_at), size));
+                out.push((
+                    entry.request,
+                    now().saturating_sub(entry.fetched_at),
+                    size,
+                    entry.refusal.is_some(),
+                ));
             }
         }
-        out.sort_by_key(|(_, age, _)| *age);
+        out.sort_by_key(|(_, age, _, _)| *age);
         out
     }
 }
@@ -216,7 +268,7 @@ mod tests {
         let c = scratch("roundtrip");
         assert!(c.get("k1").is_none(), "nothing is held yet");
         c.put("k1", "GET /zones", &json!({"a": 1}));
-        assert_eq!(c.get("k1"), Some(json!({"a": 1})));
+        assert!(matches!(c.get("k1"), Some(Hit::Body(v)) if v == json!({"a": 1})));
         let _ = c.clear();
     }
 
@@ -251,7 +303,7 @@ mod tests {
         assert!(c.get("k1").is_none());
         c.put("k2", "GET /accounts", &json!(2));
         c.read = true;
-        assert_eq!(c.get("k2"), Some(json!(2)));
+        assert!(matches!(c.get("k2"), Some(Hit::Body(v)) if v == json!(2)));
         let _ = c.clear();
     }
 
@@ -282,6 +334,35 @@ mod tests {
         let k = key("t", "GET /zones/../../etc/passwd");
         assert_eq!(k.len(), 32);
         assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_refusal_is_replayed_rather_than_re_asked() {
+        // Most refusals here are facts about a plan or a token, not about a
+        // moment: re-asking costs a request per zone per run for an answer
+        // that will not have changed.
+        let c = scratch("refusal");
+        c.put_refusal(
+            "k1",
+            "GET /zones/x/rulesets/phases/http_ratelimit/entrypoint",
+            Refusal {
+                status: 404,
+                code: 10003,
+                message: "could not find entrypoint rules".into(),
+            },
+        );
+        match c.get("k1") {
+            Some(Hit::Refused(r)) => {
+                assert_eq!(r.status, 404);
+                assert_eq!(r.message, "could not find entrypoint rules");
+            }
+            _ => panic!("a stored refusal must come back as one"),
+        }
+        assert!(
+            c.entries()[0].3,
+            "and be marked as a refusal in the listing"
+        );
+        let _ = c.clear();
     }
 
     #[test]

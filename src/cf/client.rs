@@ -11,7 +11,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use reqwest::{Method, StatusCode};
 use serde_json::Value;
 
-use crate::cf::cache::{self, Cache};
+use crate::cf::cache::{self, Cache, Hit, Refusal};
 use crate::cf::config::{Auth, Profile};
 
 /// Cap on a response body, so a misbehaving endpoint cannot exhaust memory.
@@ -226,12 +226,44 @@ impl Client {
         let request = format!("{label} {}", parts.join("&"));
         let key = cache::key(&self.tag, &request);
 
-        if let Some(hit) = cache.get(&key) {
-            return Ok(hit);
+        match cache.get(&key) {
+            Some(Hit::Body(v)) => return Ok(v),
+            // Replayed with its own status and message, so a report says the
+            // same thing it would have said after asking again.
+            Some(Hit::Refused(r)) => {
+                return Err(ApiError {
+                    status: StatusCode::from_u16(r.status).unwrap_or(StatusCode::BAD_REQUEST),
+                    code: r.code,
+                    message: r.message,
+                    retry_after: None,
+                }
+                .into())
+            }
+            None => {}
         }
-        let fresh = fetch().await?;
-        cache.put(&key, request.trim(), &fresh);
-        Ok(fresh)
+
+        match fetch().await {
+            Ok(fresh) => {
+                cache.put(&key, request.trim(), &fresh);
+                Ok(fresh)
+            }
+            Err(e) => {
+                if let Some(api) = e.downcast_ref::<ApiError>() {
+                    if worth_remembering(api) {
+                        cache.put_refusal(
+                            &key,
+                            request.trim(),
+                            Refusal {
+                                status: api.status.as_u16(),
+                                code: api.code,
+                                message: api.message.clone(),
+                            },
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn auth(&self) -> Auth {
@@ -433,6 +465,17 @@ impl Client {
         }
         Ok(out)
     }
+}
+
+/// Whether a refusal is a fact rather than a moment, and so worth remembering.
+///
+/// A `4xx` here is almost always about the plan or the token: a free zone will
+/// still answer `404` on the managed-ruleset phase in a second, and a token
+/// without a permission will still lack it. A `429` is the opposite — it is
+/// entirely about the moment — and a `5xx` says nothing about the request at
+/// all, so neither is stored.
+fn worth_remembering(e: &ApiError) -> bool {
+    e.status.is_client_error() && e.status != StatusCode::TOO_MANY_REQUESTS
 }
 
 /// Whether a failure is worth waiting out rather than reporting.
@@ -671,6 +714,30 @@ mod tests {
         let e = parse_error(StatusCode::BAD_GATEWAY, b"<html>nope</html>", None);
         assert_eq!(e.message, "nope");
         assert_eq!(e.code, 0);
+    }
+
+    #[test]
+    fn only_refusals_that_are_facts_are_remembered() {
+        let at = |status| ApiError {
+            status,
+            code: 0,
+            message: String::new(),
+            retry_after: None,
+        };
+        assert!(worth_remembering(&at(StatusCode::FORBIDDEN)));
+        assert!(worth_remembering(&at(StatusCode::NOT_FOUND)));
+        assert!(
+            worth_remembering(&at(StatusCode::BAD_REQUEST)),
+            "the plan-level refusal arrives as a 400"
+        );
+        assert!(
+            !worth_remembering(&at(StatusCode::TOO_MANY_REQUESTS)),
+            "a rate limit is entirely about the moment"
+        );
+        assert!(
+            !worth_remembering(&at(StatusCode::BAD_GATEWAY)),
+            "an outage says nothing about the request"
+        );
     }
 
     #[test]

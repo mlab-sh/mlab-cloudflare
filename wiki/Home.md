@@ -53,7 +53,7 @@ nothing asks again.
 - **[Output](Output)** — a terminal render by default, raw JSON with `-o json`,
   and the rules that keep the two from mixing.
 - **[Cache](Cache)** — configuration reads are cached on disk so the several
-  commands of one audit share them. What is never cached, and why.
+  commands of one audit share them, refusals included. What is never cached, and why.
 - **[Errors](Errors)** — the envelope, the three meanings of `403`, the rate
   ceiling, and what the tool retries on your behalf.
 - **[Secrets](Secrets)** — several readable endpoints hand back live

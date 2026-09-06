@@ -13,9 +13,15 @@ Configuration does not change between those, so it is read once:
 
 | Command | Cold | Warm |
 | --- | --- | --- |
-| `dns` (19 zones) | 15.8 s | 0.18 s |
-| `dns mail` after it | 5.8 s | 0.16 s |
-| `identity` | 4.1 s | 0.7 s |
+| `dns` (19 zones) | 16.6 s | 0.2 s |
+| `posture` | 17.3 s | 0.2 s |
+| `tls` | 16.0 s | 0.2 s |
+| `identity` | 3.7 s | 0.2 s |
+
+The four together are 54 seconds cold and under a second warm — and the second
+of those four is already cheaper than the first, because the planes share reads:
+`tls` needs the DNS records and the settings blob that `dns` and `posture`
+already fetched, so it makes 134 new calls rather than 190.
 
 ## What is cached, and what never is
 
@@ -33,9 +39,28 @@ answers to the same request, so the credential is part of the key. It is hashed
 rather than stored, and a rotated token therefore misses on everything it used
 to hold, which is correct.
 
-**Failures are never cached.** A `403` may be a permission that gets granted an
-hour later. Caching it would make "not readable" sticky, and an audit would keep
-reporting an area as unread after it became readable.
+**Refusals are remembered, most of them.** This one changed after measuring.
+Before it, the second run of `posture` cost the same as the first: about 90 of
+its reads are refusals — a free zone answering `404` on the managed-ruleset
+phase, `custom_certificates` answering `400` below Business — and re-asking
+them was the entire warm cost.
+
+Those are facts about a plan or a token, not about a moment. A free zone will
+still answer `404` in a second. So a `4xx` is stored and replayed with its own
+status and message, and it ages out on the same TTL as everything else: an area
+reads as unread for at most fifteen minutes after a permission is granted, which
+is the same staleness the rest of the report already has.
+
+Two are never stored, because they are entirely about the moment: a `429`, and
+any `5xx`. A transport failure is not stored either — it says nothing about the
+request.
+
+`cache status` marks the remembered refusals, so you can see how much of the
+cache is "this is not available here":
+
+```
+  › 409 usable at a 900s TTL, 110 of them remembered refusals, 271.7 kB on disk
+```
 
 ## Flags
 
@@ -52,6 +77,29 @@ so nothing is stored.
 
 The TTL is compared at read time, not at write time, so lowering it re-ages what
 is already held rather than requiring a clear.
+
+## What is cached
+
+| Read | Cached |
+| --- | --- |
+| Zones, accounts, DNS records, DNSSEC, holds | yes |
+| Zone settings, ruleset phases, page rules, Spectrum, routes, snippets | yes |
+| Certificates, origin pulls, custom hostnames, client certificates | yes |
+| Members, roles, SSO, SCIM, IAM groups, OAuth clients, tokens | yes |
+| A token's own policies (`whoami`) | yes |
+| **Token verification** (`ping`, `whoami`) | never — liveness |
+| **`/user`** under key auth | never — liveness |
+| **The audit log** (`activity`) | never — see below |
+| **`api`** | only with `--cache` |
+
+`activity` is not cached for two reasons that point the same way: it is the
+command you run to see what just happened, so a stale answer is the bug rather
+than the saving — and its `since` is derived from the clock, so every run would
+key differently and store an entry nothing ever reads.
+
+`api` takes `--cache` rather than caching by default. It is the bench you probe
+an endpoint from, and a stale answer there is far more confusing than a slow one.
+Only a plain `GET` with no body is eligible.
 
 ## The `cache` command
 

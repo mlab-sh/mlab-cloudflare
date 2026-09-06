@@ -52,6 +52,10 @@ pub async fn run(c: &Client, ctx: &Ctx, a: &ActivityArgs) -> Result<()> {
         q.push(("actor.email".to_string(), actor.clone()));
     }
 
+    // Deliberately not cached, for two reasons that point the same way. This is
+    // the command you run to see what just happened, so a stale answer is the
+    // bug rather than the saving; and `since` is derived from the clock, so
+    // every run would key differently and store an entry that never gets read.
     let path = format!("/accounts/{}/audit_logs", esc(&account));
     let entries = ui::spin(
         &format!("Reading the last {window}"),

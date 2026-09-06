@@ -35,11 +35,15 @@ pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
             let entries = cache.entries();
             let rows: Vec<Value> = entries
                 .iter()
-                .map(|(request, age, size)| {
+                .map(|(request, age, size, refused)| {
                     json!({
                         "request": abbreviate(request),
                         "age": ui::elapsed(Duration::from_secs(*age)),
-                        "state": if *age < ttl.as_secs() { "usable" } else { "stale" },
+                        "state": match (*age < ttl.as_secs(), refused) {
+                            (false, _) => "stale",
+                            (true, true) => "refused",
+                            (true, false) => "usable",
+                        },
                         "kb": size / 1024,
                     })
                 })
@@ -52,12 +56,13 @@ pub fn run(cmd: &CacheCmd, ttl: Duration) -> Result<()> {
             if !render::is_json() {
                 let usable = entries
                     .iter()
-                    .filter(|(_, age, _)| *age < ttl.as_secs())
+                    .filter(|(_, age, _, _)| *age < ttl.as_secs())
                     .count();
-                let bytes: u64 = entries.iter().map(|(_, _, size)| size).sum();
+                let refused = entries.iter().filter(|(_, _, _, r)| *r).count();
+                let bytes: u64 = entries.iter().map(|(_, _, size, _)| size).sum();
                 ui::gap();
                 ui::info(&format!(
-                    "{usable} usable at a {}s TTL, {} on disk",
+                    "{usable} usable at a {}s TTL, {refused} of them remembered refusals, {} on disk",
                     ttl.as_secs(),
                     human(bytes)
                 ));

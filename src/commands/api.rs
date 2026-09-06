@@ -43,6 +43,12 @@ pub struct ApiArgs {
     /// Replace every credential in the response by its length, before printing
     #[arg(long)]
     pub redact: bool,
+    /// Serve this read from the response cache, and store it
+    ///
+    /// Off by default: this is the command you probe an endpoint from, and a
+    /// stale answer here is far more confusing than a slow one.
+    #[arg(long)]
+    pub cache: bool,
 }
 
 pub async fn run(c: &Client, ctx: &Ctx, a: ApiArgs) -> Result<()> {
@@ -83,10 +89,11 @@ pub async fn run(c: &Client, ctx: &Ctx, a: ApiArgs) -> Result<()> {
         if body.is_some() {
             bail!("--list cannot be combined with --data");
         }
-        let mut rows = if a.cursor {
-            ui::spin(&label, c.list_cursor(&path, &query, a.limit)).await?
-        } else {
-            ui::spin(&label, c.list(&path, &query, a.limit)).await?
+        let mut rows = match (a.cursor, a.cache) {
+            (true, true) => ui::spin(&label, c.cached_list_cursor(&path, &query, a.limit)).await?,
+            (true, false) => ui::spin(&label, c.list_cursor(&path, &query, a.limit)).await?,
+            (false, true) => ui::spin(&label, c.cached_list(&path, &query, a.limit)).await?,
+            (false, false) => ui::spin(&label, c.list(&path, &query, a.limit)).await?,
         };
         if a.redact {
             let mut all = Value::Array(rows);
@@ -100,10 +107,12 @@ pub async fn run(c: &Client, ctx: &Ctx, a: ApiArgs) -> Result<()> {
         return Ok(());
     }
 
-    let mut v = if a.raw {
-        ui::spin(&label, c.envelope(method, &path, &query, body.as_ref())).await?
-    } else {
-        ui::spin(&label, c.request(method, &path, &query, body.as_ref())).await?
+    let mut v = match (a.raw, a.cache && method == Method::GET && body.is_none()) {
+        (true, _) => ui::spin(&label, c.envelope(method, &path, &query, body.as_ref())).await?,
+        // Only a plain GET is cacheable, and only its result: the envelope is
+        // what `--raw` is for, and a body makes the request something else.
+        (false, true) => ui::spin(&label, c.cached(&path, &query)).await?,
+        (false, false) => ui::spin(&label, c.request(method, &path, &query, body.as_ref())).await?,
     };
     // Several readable endpoints hand back a live credential — a tunnel's
     // connector token, a Turnstile widget's secret. `--redact` is what makes
