@@ -3739,6 +3739,400 @@ pub fn alerting(a: &Alerting) -> Vec<Finding> {
     out
 }
 
+// ---- the routed network ----------------------------------------------------
+
+/// One Magic WAN site and the segmentation configured on it.
+pub struct Site {
+    pub name: String,
+    pub acls: Vec<Value>,
+    pub lans: Vec<Value>,
+}
+
+/// The routed estate, where an account has one.
+///
+/// Every field here is empty on an account that did not buy Magic Transit,
+/// BYOIP or load balancing — which is most of them. An empty plane is a fact,
+/// and the command that reads this says so rather than grading nothing.
+pub struct Network {
+    pub sites: Vec<Site>,
+    pub ipsec: Vec<Value>,
+    pub gre: Vec<Value>,
+    pub routes: Vec<Value>,
+    pub prefixes: Vec<Value>,
+    pub address_maps: Vec<Value>,
+    pub dns_firewall: Vec<Value>,
+    pub load_balancers: Vec<Value>,
+    pub pools: Vec<Value>,
+    pub monitors: Vec<Value>,
+}
+
+impl Network {
+    pub fn is_empty(&self) -> bool {
+        self.sites.is_empty()
+            && self.ipsec.is_empty()
+            && self.gre.is_empty()
+            && self.routes.is_empty()
+            && self.prefixes.is_empty()
+            && self.dns_firewall.is_empty()
+            && self.load_balancers.is_empty()
+            && self.pools.is_empty()
+    }
+}
+
+/// The tunnels and the routing between sites.
+pub fn magic(n: &Network) -> Vec<Finding> {
+    let mut unencrypted = Vec::new();
+    let mut unchecked = Vec::new();
+    let mut replayable = Vec::new();
+    let mut flat = Vec::new();
+
+    for t in n.ipsec.iter().chain(n.gre.iter()) {
+        let name = str_of(t, "name");
+        // An IPsec tunnel with a null cipher authenticates and does not
+        // encrypt, which is the one thing everyone assumes it does.
+        if t.get("allow_null_cipher").and_then(Value::as_bool) == Some(true) {
+            unencrypted.push(name.clone());
+        }
+        if t.get("health_check")
+            .and_then(|h| h.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            unchecked.push(name.clone());
+        }
+        // Only IPsec carries this; a GRE tunnel has no such setting and its
+        // absence must not be read as "off".
+        if t.get("replay_protection").and_then(Value::as_bool) == Some(false) {
+            replayable.push(name);
+        }
+    }
+
+    // A rule pairing two whole LANs with every protocol is a flat network
+    // wearing a segmentation diagram, and it is invisible from either site's
+    // own configuration.
+    for site in &n.sites {
+        for acl in &site.acls {
+            let unrestricted = |side: &str| {
+                acl.get(side).is_some_and(|l| {
+                    empty_list(l, "ports")
+                        && empty_list(l, "port_ranges")
+                        && empty_list(l, "subnets")
+                })
+            };
+            let all_protocols = empty_list(acl, "protocols");
+            if all_protocols && unrestricted("lan_1") && unrestricted("lan_2") {
+                flat.push(format!("{}: {}", site.name, str_of(acl, "name")));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "magic", text).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} {} a null cipher, so it authenticates the peer and sends the traffic in \
+             clear",
+            unencrypted.len(),
+            agree(unencrypted.len(), "tunnel permits", "tunnels permit")
+        ),
+        unencrypted.clone(),
+    );
+    push(
+        Severity::High,
+        format!(
+            "{} site {} two whole LANs on every protocol, which is a flat network wearing \
+             a segmentation diagram",
+            flat.len(),
+            agree(flat.len(), "rule pairs", "rules pair")
+        ),
+        flat.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} health checks off, so failover has nothing to act on",
+            unchecked.len(),
+            agree(unchecked.len(), "tunnel has", "tunnels have")
+        ),
+        unchecked.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} IPsec {} replay protection off",
+            replayable.len(),
+            agree(replayable.len(), "tunnel has", "tunnels have")
+        ),
+        replayable.clone(),
+    );
+
+    out.extend(overlapping_routes(&n.routes));
+    out
+}
+
+/// Static routes that cover the same address space at the same priority.
+///
+/// Two routes for one destination at equal priority is a decision made per
+/// packet rather than by the design, and neither route's own definition shows
+/// it — only the pair does.
+fn overlapping_routes(routes: &[Value]) -> Vec<Finding> {
+    let mut clashes = Vec::new();
+    for (i, a) in routes.iter().enumerate() {
+        for b in routes.iter().skip(i + 1) {
+            let (pa, pb) = (str_of(a, "prefix"), str_of(b, "prefix"));
+            if str_of(a, "nexthop") == str_of(b, "nexthop") {
+                continue;
+            }
+            let (ra, rb) = (
+                a.get("priority").and_then(Value::as_i64),
+                b.get("priority").and_then(Value::as_i64),
+            );
+            if ra != rb {
+                continue;
+            }
+            if covers(&pa, &pb) || covers(&pb, &pa) {
+                clashes.push(format!(
+                    "{pa} → {} and {pb} → {}",
+                    str_of(a, "nexthop"),
+                    str_of(b, "nexthop")
+                ));
+            }
+        }
+    }
+    if clashes.is_empty() {
+        return Vec::new();
+    }
+    vec![Finding::new(
+        Severity::Medium,
+        "magic",
+        format!(
+            "{} static {} the same space at the same priority, so which one wins is \
+             decided per packet",
+            clashes.len(),
+            agree(clashes.len(), "route pair covers", "route pairs cover")
+        ),
+    )
+    .with(clashes.join("; "))]
+}
+
+/// Whether `outer` contains `inner`, for IPv4 prefixes.
+///
+/// IPv6 is left alone rather than guessed at: a wrong answer about routing is
+/// worse than no answer, and the overlaps that bite in practice are v4.
+fn covers(outer: &str, inner: &str) -> bool {
+    let parse = |cidr: &str| -> Option<(u32, u8)> {
+        let (addr, len) = cidr.split_once('/')?;
+        let ip: std::net::Ipv4Addr = addr.parse().ok()?;
+        Some((u32::from(ip), len.parse().ok()?))
+    };
+    let (Some((a, la)), Some((b, lb))) = (parse(outer), parse(inner)) else {
+        return false;
+    };
+    if la > lb || la > 32 {
+        return false;
+    }
+    let mask = if la == 0 { 0 } else { u32::MAX << (32 - la) };
+    a & mask == b & mask
+}
+
+/// Address space announced on this account's behalf.
+pub fn addressing(n: &Network) -> Vec<Finding> {
+    let mut idle = Vec::new();
+    let mut unvalidated = Vec::new();
+
+    // Every prefix an address map binds is in use; the rest are announced for
+    // nothing.
+    let bound: BTreeSet<String> = n
+        .address_maps
+        .iter()
+        .flat_map(|m| list(m, "ips").to_vec())
+        .map(|ip| str_of(&ip, "ip"))
+        .collect();
+
+    for p in &n.prefixes {
+        let cidr = str_of(p, "cidr");
+        if p.get("advertised").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        if !bound.iter().any(|ip| covers(&cidr, &format!("{ip}/32"))) {
+            idle.push(cidr.clone());
+        }
+        if !matches!(str_of(p, "rpki_validation_state").as_str(), "valid" | "") {
+            unvalidated.push(format!("{cidr} ({})", str_of(p, "rpki_validation_state")));
+        }
+    }
+
+    let mut out = Vec::new();
+    if !idle.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "addressing",
+                format!(
+                    "{} {} advertised from Cloudflare with nothing bound to {}",
+                    idle.len(),
+                    agree(idle.len(), "prefix is", "prefixes are"),
+                    agree(idle.len(), "it", "them")
+                ),
+            )
+            .with(idle.join(", ")),
+        );
+    }
+    if !unvalidated.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "addressing",
+                format!(
+                    "{} advertised {} an RPKI state other than valid, so the announcement \
+                     can be dropped by validating networks",
+                    unvalidated.len(),
+                    agree(unvalidated.len(), "prefix has", "prefixes have")
+                ),
+            )
+            .with(unvalidated.join(", ")),
+        );
+    }
+    out
+}
+
+/// Load balancing, and whether failover has anything to act on.
+pub fn balancing(n: &Network) -> Vec<Finding> {
+    let mut unmonitored = Vec::new();
+    let mut no_fallback = Vec::new();
+    let mut disabled_origins = Vec::new();
+
+    let monitors: BTreeSet<String> = n.monitors.iter().map(|m| str_of(m, "id")).collect();
+
+    for p in &n.pools {
+        let name = str_of(p, "name");
+        let monitor = str_of(p, "monitor");
+        // A pool with no monitor, or one pointing at a monitor that no longer
+        // exists, never marks an origin unhealthy — so it never fails over.
+        if monitor.is_empty() || !monitors.contains(&monitor) {
+            unmonitored.push(name.clone());
+        }
+        let off: Vec<String> = list(p, "origins")
+            .iter()
+            .filter(|o| o.get("enabled").and_then(Value::as_bool) == Some(false))
+            .map(|o| format!("{}/{}", name, str_of(o, "name")))
+            .collect();
+        disabled_origins.extend(off);
+    }
+
+    for lb in &n.load_balancers {
+        if str_of(lb, "fallback_pool").is_empty() {
+            no_fallback.push(str_of(lb, "name"));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "balancing", text).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} no working monitor, so {} never marks an origin unhealthy and never \
+             fails over",
+            unmonitored.len(),
+            agree(unmonitored.len(), "pool has", "pools have"),
+            agree(unmonitored.len(), "it", "they")
+        ),
+        unmonitored.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} load {} no fallback pool, so traffic is dropped rather than shed when every \
+             pool is unhealthy",
+            no_fallback.len(),
+            agree(no_fallback.len(), "balancer has", "balancers have")
+        ),
+        no_fallback.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} disabled {} still listed in a pool, which is a record of infrastructure \
+             that may still be listening",
+            disabled_origins.len(),
+            agree(disabled_origins.len(), "origin is", "origins are")
+        ),
+        disabled_origins.clone(),
+    );
+    out
+}
+
+/// DNS Firewall clusters, and where they forward.
+pub fn dns_firewall(n: &Network) -> Vec<Finding> {
+    let mut upstreams = Vec::new();
+    let mut unlimited = Vec::new();
+
+    for c in &n.dns_firewall {
+        let name = str_of(c, "name");
+        let ips: Vec<String> = list(c, "upstream_ips")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        if !ips.is_empty() {
+            upstreams.push(format!("{name} → {}", ips.join(", ")));
+        }
+        if c.get("ratelimit").and_then(Value::as_f64).unwrap_or(0.0) == 0.0 {
+            unlimited.push(name);
+        }
+    }
+
+    let mut out = Vec::new();
+    if !unlimited.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Low,
+                "dns firewall",
+                format!(
+                    "{} {} no rate limit, so a flood is forwarded to the upstream resolvers",
+                    unlimited.len(),
+                    agree(unlimited.len(), "cluster has", "clusters have")
+                ),
+            )
+            .with(unlimited.join(", ")),
+        );
+    }
+    if !upstreams.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Info,
+                "dns firewall",
+                format!(
+                    "{} {} to resolvers outside Cloudflare",
+                    upstreams.len(),
+                    agree(upstreams.len(), "cluster forwards", "clusters forward")
+                ),
+            )
+            .with(upstreams.join("; ")),
+        );
+    }
+    out
+}
+
+/// Whether a list-valued field is absent or empty, which on an ACL side means
+/// "everything" rather than "nothing".
+fn empty_list(v: &Value, key: &str) -> bool {
+    v.get(key)
+        .map(|x| x.as_array().is_none_or(|a| a.is_empty()))
+        .unwrap_or(true)
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -5628,6 +6022,220 @@ mod tests {
 
         // An account that cannot receive anything gets no finding.
         assert!(alerting(&alerting_of(json!([]), &[])).is_empty());
+    }
+
+    // ---- the routed network ---------------------------------------------------
+
+    fn network() -> Network {
+        Network {
+            sites: vec![],
+            ipsec: vec![],
+            gre: vec![],
+            routes: vec![],
+            prefixes: vec![],
+            address_maps: vec![],
+            dns_firewall: vec![],
+            load_balancers: vec![],
+            pools: vec![],
+            monitors: vec![],
+        }
+    }
+
+    #[test]
+    fn an_empty_plane_is_empty_and_produces_nothing() {
+        // Most accounts do not route through Cloudflare at all.
+        let n = network();
+        assert!(n.is_empty());
+        assert!(magic(&n).is_empty());
+        assert!(addressing(&n).is_empty());
+        assert!(balancing(&n).is_empty());
+    }
+
+    #[test]
+    fn a_tunnel_that_permits_a_null_cipher_does_not_encrypt() {
+        let mut n = network();
+        n.ipsec = vec![
+            json!({"name": "clear", "allow_null_cipher": true, "replay_protection": true}),
+            json!({"name": "proper", "allow_null_cipher": false, "replay_protection": true}),
+        ];
+        let f = magic(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("null cipher"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert_eq!(hit.detail, "clear");
+    }
+
+    #[test]
+    fn replay_protection_is_only_judged_where_the_setting_exists() {
+        // A GRE tunnel has no such setting, and its absence is not "off".
+        let mut n = network();
+        n.gre = vec![json!({"name": "gre-1"})];
+        n.ipsec = vec![json!({"name": "ipsec-1", "replay_protection": false})];
+        let f = magic(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("replay protection"))
+            .unwrap();
+        assert_eq!(hit.detail, "ipsec-1");
+    }
+
+    #[test]
+    fn a_tunnel_with_health_checks_off_fails_over_on_nothing() {
+        let mut n = network();
+        n.gre = vec![
+            json!({"name": "blind", "health_check": {"enabled": false}}),
+            json!({"name": "watched", "health_check": {"enabled": true}}),
+        ];
+        let f = magic(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("health checks off"))
+            .unwrap();
+        assert_eq!(hit.detail, "blind");
+    }
+
+    #[test]
+    fn an_acl_pairing_two_whole_lans_on_every_protocol_is_a_flat_network() {
+        let mut n = network();
+        n.sites = vec![Site {
+            name: "hq".into(),
+            lans: vec![],
+            acls: vec![
+                json!({"name": "everything", "protocols": [],
+                       "lan_1": {"lan_name": "office"}, "lan_2": {"lan_name": "servers"}}),
+                json!({"name": "narrow", "protocols": ["tcp"],
+                       "lan_1": {"lan_name": "office", "ports": [443]},
+                       "lan_2": {"lan_name": "servers", "subnets": ["10.1.0.0/24"]}}),
+            ],
+        }];
+        let f = magic(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("two whole LANs"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(hit.detail.contains("everything"));
+        assert!(!hit.detail.contains("narrow"));
+    }
+
+    #[test]
+    fn routes_covering_the_same_space_at_one_priority_are_decided_per_packet() {
+        let mut n = network();
+        n.routes = vec![
+            json!({"prefix": "10.0.0.0/8", "nexthop": "10.1.1.1", "priority": 100}),
+            json!({"prefix": "10.4.0.0/16", "nexthop": "10.2.2.2", "priority": 100}),
+            // Different priority: the design has decided.
+            json!({"prefix": "10.5.0.0/16", "nexthop": "10.3.3.3", "priority": 200}),
+        ];
+        let f = magic(&n);
+        let hit = f.iter().find(|f| f.finding.contains("same space")).unwrap();
+        assert!(hit.detail.contains("10.0.0.0/8"));
+        assert!(
+            !hit.detail.contains("10.5.0.0/16"),
+            "priority separates them"
+        );
+    }
+
+    #[test]
+    fn prefix_containment_is_computed_rather_than_string_matched() {
+        assert!(covers("10.0.0.0/8", "10.4.0.0/16"));
+        assert!(
+            covers("0.0.0.0/0", "192.0.2.0/24"),
+            "a default route covers everything"
+        );
+        assert!(
+            !covers("10.4.0.0/16", "10.0.0.0/8"),
+            "containment has a direction"
+        );
+        assert!(!covers("10.0.0.0/8", "172.16.0.0/12"));
+        assert!(
+            !covers("2001:db8::/32", "2001:db8:1::/48"),
+            "v6 is left alone rather than guessed at"
+        );
+        assert!(!covers("nonsense", "10.0.0.0/8"));
+    }
+
+    #[test]
+    fn a_prefix_advertised_with_nothing_bound_to_it_is_announced_for_nothing() {
+        let mut n = network();
+        n.prefixes = vec![
+            json!({"cidr": "192.0.2.0/24", "advertised": true, "rpki_validation_state": "valid"}),
+            json!({"cidr": "198.51.100.0/24", "advertised": true, "rpki_validation_state": "valid"}),
+            // Not advertised: nothing is being announced, so nothing is idle.
+            json!({"cidr": "203.0.113.0/24", "advertised": false}),
+        ];
+        n.address_maps = vec![json!({"ips": [{"ip": "192.0.2.10"}]})];
+        let f = addressing(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("nothing bound"))
+            .unwrap();
+        assert!(hit.detail.contains("198.51.100.0/24"));
+        assert!(
+            !hit.detail.contains("192.0.2.0/24"),
+            "an address map binds it"
+        );
+        assert!(!hit.detail.contains("203.0.113.0/24"));
+    }
+
+    #[test]
+    fn an_rpki_state_other_than_valid_can_be_dropped_by_validating_networks() {
+        let mut n = network();
+        n.prefixes = vec![json!({
+            "cidr": "192.0.2.0/24", "advertised": true, "rpki_validation_state": "invalid"
+        })];
+        let f = addressing(&n);
+        assert_eq!(at(&f, "RPKI state other than valid"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_pool_whose_monitor_is_missing_never_fails_over() {
+        let mut n = network();
+        n.monitors = vec![json!({"id": "m-1", "type": "https"})];
+        n.pools = vec![
+            json!({"name": "eu", "monitor": "m-1", "origins": []}),
+            json!({"name": "us", "monitor": "m-gone", "origins": []}),
+            json!({"name": "ap", "origins": []}),
+        ];
+        let f = balancing(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("no working monitor"))
+            .unwrap();
+        assert!(
+            hit.detail.contains("us"),
+            "a dangling reference is as bad as none"
+        );
+        assert!(hit.detail.contains("ap"));
+        assert!(!hit.detail.contains("eu"));
+    }
+
+    #[test]
+    fn a_balancer_with_no_fallback_pool_drops_rather_than_sheds() {
+        let mut n = network();
+        n.load_balancers = vec![
+            json!({"name": "www", "fallback_pool": ""}),
+            json!({"name": "api", "fallback_pool": "p-1"}),
+        ];
+        let f = balancing(&n);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("no fallback pool"))
+            .unwrap();
+        assert_eq!(hit.detail, "www");
+    }
+
+    #[test]
+    fn a_dns_firewall_cluster_names_where_it_forwards() {
+        let mut n = network();
+        n.dns_firewall = vec![json!({
+            "name": "corp", "upstream_ips": ["198.51.100.1", "198.51.100.2"], "ratelimit": 0
+        })];
+        let f = dns_firewall(&n);
+        assert!(f.iter().any(|f| f.detail.contains("198.51.100.1")));
+        assert_eq!(at(&f, "no rate limit"), Severity::Low);
     }
 
     // ---- ordering -----------------------------------------------------------

@@ -66,6 +66,7 @@ which is where wrangler and the Terraform provider already put them.
 | `tls` | What browsers are served, and whether the origin will talk to anyone. Graded findings. |
 | `platform` | What developers provisioned, and what it is reachable on. Graded findings. |
 | `zerotrust` | Who reaches internal systems, and is fleet traffic inspected. Graded findings. |
+| `network` | The routed estate: tunnels, routes, announced space, balancers. Graded findings. |
 | `egress` | Where the request data goes, and whether any of it is kept. Graded findings. |
 | `alerts` | Whether anyone is told when something breaks. Graded findings. |
 | `identity` | Who can change this account, and with what. Graded findings. |

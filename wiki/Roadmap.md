@@ -127,10 +127,21 @@ over fetched data) plus the two commands that use it.
 - The plane most likely to be entirely unreadable, so it prints what it could
   not read and says the plane is unaudited rather than clean
 
-## Phase 9 — network
+## Phase 9 — network — **done**
 
-Only on accounts that bought Magic Transit or WAN: site ACLs, tunnels, static
-routes, BYOIP prefixes, DNS Firewall clusters, load balancer pools.
+[`network`](Network), with `magic`, `addressing` and `balancing`.
+
+- Tunnels permitting a null cipher, health checks off, replay protection off
+  where the setting exists
+- Site ACLs pairing two whole LANs on every protocol, where an empty list means
+  "all" rather than "none"
+- Static routes covering the same space at one priority, with containment
+  computed rather than string-matched
+- Advertised prefixes nothing is bound to, and RPKI states other than valid
+- Pools whose monitor is absent *or* dangling, balancers with no fallback
+- The one plane that could not be exercised live: the account it was built
+  against routes nothing through Cloudflare, so the tests carry it and the
+  empty case is what was verified end to end
 
 ## Phase 10 — snapshot and diff
 

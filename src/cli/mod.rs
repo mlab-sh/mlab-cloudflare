@@ -127,6 +127,12 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// The routed estate: tunnels, static routes, announced space, balancers
+    Network {
+        #[command(subcommand)]
+        cmd: Option<commands::network::NetworkCmd>,
+    },
+
     /// Where the request data goes, and whether any of it is kept
     Egress {
         #[command(subcommand)]
@@ -238,6 +244,7 @@ pub async fn run() -> Result<()> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Network { cmd } => commands::network::run(&c, &ctx, cmd).await,
         Cmd::Egress { cmd } => commands::egress::run_egress(&c, &ctx, cmd).await,
         Cmd::Alerts { cmd } => commands::egress::run_alerts(&c, &ctx, cmd).await,
         Cmd::Zerotrust { cmd } => commands::zerotrust::run(&c, &ctx, cmd).await,

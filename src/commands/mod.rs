@@ -12,6 +12,7 @@ pub mod dns;
 pub mod egress;
 pub mod identity;
 pub mod login;
+pub mod network;
 pub mod ping;
 pub mod platform;
 pub mod posture;

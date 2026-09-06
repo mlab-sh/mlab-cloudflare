@@ -294,6 +294,64 @@ pub const DESTINATION_COLS: &[Col] = &[
 
 pub const UNREAD_EGRESS_COLS: &[Col] = &[Col("ENDPOINT", &["path"]), Col("WHY", &["reason"])];
 
+pub const TUNNEL_COLS: &[Col] = &[
+    Col("KIND", &["kind"]),
+    Col("NAME", &["name"]),
+    Col("PEER", &["peer"]),
+    Col("INTERFACE", &["interface"]),
+    Col("HEALTH CHECK", &["healthCheck"]),
+    Col("REPLAY GUARD", &["replayProtection"]),
+    Col("NULL CIPHER", &["nullCipher"]),
+];
+
+pub const STATIC_ROUTE_COLS: &[Col] = &[
+    Col("PREFIX", &["prefix"]),
+    Col("NEXT HOP", &["nexthop"]),
+    Col("PRIORITY", &["priority"]),
+    Col("WEIGHT", &["weight"]),
+    Col("NOTE", &["note"]),
+];
+
+/// What may reach what between two sites.
+pub const ACL_COLS: &[Col] = &[
+    Col("RULE", &["rule"]),
+    Col("FROM", &["from"]),
+    Col("TO", &["to"]),
+    Col("PROTOCOLS", &["protocols"]),
+    Col("ONE WAY", &["oneWay"]),
+];
+
+pub const PREFIX_COLS: &[Col] = &[
+    Col("CIDR", &["cidr"]),
+    Col("ADVERTISED", &["advertised"]),
+    Col("APPROVED", &["approved"]),
+    Col("RPKI", &["rpki"]),
+    Col("NOTE", &["note"]),
+];
+
+pub const DNSFW_COLS: &[Col] = &[
+    Col("CLUSTER", &["cluster"]),
+    Col("UPSTREAMS", &["upstreams"]),
+    Col("RATE LIMIT", &["ratelimit"]),
+    Col("MAX CACHE TTL", &["cacheTtl"]),
+];
+
+pub const POOL_COLS: &[Col] = &[
+    Col("POOL", &["pool"]),
+    Col("ON", &["on"]),
+    Col("ORIGINS", &["origins"]),
+    Col("MINIMUM", &["minimum"]),
+    Col("MONITOR", &["monitor"]),
+];
+
+pub const LB_COLS: &[Col] = &[
+    Col("BALANCER", &["balancer"]),
+    Col("ON", &["on"]),
+    Col("STEERING", &["steering"]),
+    Col("POOLS", &["pools"]),
+    Col("FALLBACK", &["fallback"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),
@@ -735,7 +793,7 @@ fn tint(s: &str) -> colored::ColoredString {
         "deny" | "block" | "failed" | "write" | "+all" | "?all" | "flexible"
         | "essentially_off" => s.red(),
         "skip" | "log" | "full" | "1.0" | "1.1" | "pending_validation" => s.yellow(),
-        "reachable" => s.red().bold(),
+        "reachable" | "missing" => s.red().bold(),
         "not readable" => s.dimmed(),
         "strict" | "managed_challenge" | "challenge" | "1.2" | "1.3" => s.green(),
         "~all" | "p=quarantine" | "p=none" | "set" => s.yellow(),
