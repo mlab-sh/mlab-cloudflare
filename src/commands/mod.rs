@@ -19,6 +19,7 @@ pub mod prompt;
 pub mod settings;
 pub mod tls;
 pub mod whoami;
+pub mod zerotrust;
 pub mod zones;
 
 /// The names of the rows matching `pred`, for the one-line observations the

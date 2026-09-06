@@ -65,6 +65,7 @@ which is where wrangler and the Terraform provider already put them.
 | `posture` | What the edge enforces, and what is carved out of it. Graded findings. |
 | `tls` | What browsers are served, and whether the origin will talk to anyone. Graded findings. |
 | `platform` | What developers provisioned, and what it is reachable on. Graded findings. |
+| `zerotrust` | Who reaches internal systems, and is fleet traffic inspected. Graded findings. |
 | `identity` | Who can change this account, and with what. Graded findings. |
 | `activity` | What was actually done to this account, and by whom. |
 | `api` | Raw request against any endpoint, for everything not wrapped yet. |

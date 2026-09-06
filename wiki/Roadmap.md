@@ -91,12 +91,24 @@ over fetched data) plus the two commands that use it.
 - Six reads in flight at once: one at a time was a minute of round trips for
   forty scripts
 
-## Phase 7 — Zero Trust
+## Phase 7 — Zero Trust — **done**
 
-Access policies, Gateway rules, split-tunnel exclusions, tunnel ingress. The
-largest read, and the one that has to degrade cleanly when the entitlement is
-absent — which is most accounts. Redaction is mandatory here: a tunnel's token
-endpoint returns a live connector credential.
+[`zerotrust`](Zerotrust) (alias `zt`), with `access`, `gateway`, `devices` and
+`tunnels`.
+
+- Access policies graded by what admits and what requires: `everyone`,
+  `bypass`, an address with no second factor, a one-time-PIN provider
+- Gateway configured with no policy at all, allow rules above the first block,
+  inspection and logging switched off
+- Split-tunnel exclusions that send *routable* traffic around Gateway — the
+  default list is special-purpose space, and flagging it produced eight false
+  findings before the distinction went in
+- Posture rules no Access policy references
+- Tunnel ingress as the internal exposure map, with a locally-configured tunnel
+  reported as unread rather than as publishing nothing
+- `/cfd_tunnel/{id}/token` is never called: not reading a live credential is
+  stronger than redacting it
+- An account without Zero Trust gets two lines, not a wall of findings
 
 ## Phase 8 — egress, logging and alerting
 

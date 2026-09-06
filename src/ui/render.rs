@@ -207,6 +207,59 @@ pub const PAGES_COLS: &[Col] = &[
     Col("AUTO-BUILD", &["autoBuild"]),
 ];
 
+/// One row per Access policy: who gets in, and on what evidence.
+pub const ACCESS_COLS: &[Col] = &[
+    Col("APPLICATION", &["application"]),
+    Col("TYPE", &["type"]),
+    Col("DOMAIN", &["domain"]),
+    Col("POLICY", &["policy"]),
+    Col("DECISION", &["decision"]),
+    Col("ADMITS", &["admits"]),
+    Col("REQUIRES", &["requires"]),
+    Col("SESSION", &["session"]),
+];
+
+pub const IDP_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("TYPE", &["type"]),
+    Col("SCIM", &["scim"]),
+];
+
+pub const DEVICE_COLS: &[Col] = &[
+    Col("PROFILE", &["profile"]),
+    Col("MODE", &["mode"]),
+    Col("ON", &["on"]),
+    Col("USER CAN DISABLE", &["userCanDisable"]),
+    Col("AUTO-UPDATE", &["autoUpdate"]),
+];
+
+pub const SPLIT_COLS: &[Col] = &[
+    Col("MODE", &["mode"]),
+    Col("TARGET", &["target"]),
+    Col("NOTE", &["note"]),
+];
+
+pub const POSTURE_RULE_COLS: &[Col] = &[
+    Col("NAME", &["name"]),
+    Col("TYPE", &["type"]),
+    Col("ID", &["id"]),
+];
+
+/// The authoritative list of what the internet can reach inside.
+pub const INGRESS_COLS: &[Col] = &[
+    Col("TUNNEL", &["tunnel"]),
+    Col("STATUS", &["status"]),
+    Col("HOSTNAME", &["hostname"]),
+    Col("REACHES", &["service"]),
+    Col("PATH", &["path"]),
+];
+
+pub const ROUTE_COLS: &[Col] = &[
+    Col("NETWORK", &["network"]),
+    Col("NOTE", &["note"]),
+    Col("VIRTUAL NETWORK", &["vnet"]),
+];
+
 /// What an audit could not look at, so a report never implies it did.
 pub const UNREAD_COLS: &[Col] = &[
     Col("AREA", &["area"]),
@@ -626,7 +679,7 @@ fn rank(key: &str) -> u8 {
 /// Colour a cell by what it says: statuses read faster than they scan.
 fn tint(s: &str) -> colored::ColoredString {
     match s {
-        "active" | "ok" | "healthy" | "on" | "verified" | "true" | "usable" => s.green(),
+        "active" | "ok" | "healthy" | "on" | "verified" | "true" | "usable" | "warp" => s.green(),
         // `false` is an absence, not a fault — a list of unproxied records must
         // not read as a wall of errors.
         "false" => s.dimmed(),
@@ -644,6 +697,7 @@ fn tint(s: &str) -> colored::ColoredString {
         "medium" | "weak" => s.yellow(),
         "low" | "info" | "unknown" | "none" | "stale" => s.dimmed(),
         "allow" | "read" | "-all" | "p=reject" => s.green(),
+        "bypass" | "everyone" => s.red().bold(),
         "deny" | "block" | "failed" | "write" | "+all" | "?all" | "flexible"
         | "essentially_off" => s.red(),
         "skip" | "log" | "full" | "1.0" | "1.1" | "pending_validation" => s.yellow(),

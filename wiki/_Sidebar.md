@@ -9,6 +9,7 @@
 - [posture](Posture)
 - [tls](Tls)
 - [platform](Platform)
+- [zerotrust](Zerotrust)
 - [identity](Identity)
 - [activity](Activity)
 - [login](Login)

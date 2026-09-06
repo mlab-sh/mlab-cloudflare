@@ -127,6 +127,13 @@ pub enum Cmd {
         cmd: Option<commands::dns::DnsCmd>,
     },
 
+    /// Who reaches internal systems, and whether fleet traffic is inspected
+    #[command(alias = "zt")]
+    Zerotrust {
+        #[command(subcommand)]
+        cmd: Option<commands::zerotrust::ZeroTrustCmd>,
+    },
+
     /// What developers provisioned, and what it is reachable on
     Platform {
         #[command(subcommand)]
@@ -218,6 +225,7 @@ pub async fn run() -> Result<()> {
         Cmd::Accounts(a) => commands::accounts::run(&c, &ctx, &a).await,
         Cmd::Zones(a) => commands::zones::run(&c, &ctx, &a).await,
         Cmd::Dns { cmd } => commands::dns::run(&c, &ctx, cmd).await,
+        Cmd::Zerotrust { cmd } => commands::zerotrust::run(&c, &ctx, cmd).await,
         Cmd::Platform { cmd } => commands::platform::run(&c, &ctx, cmd).await,
         Cmd::Tls { cmd } => commands::tls::run(&c, &ctx, cmd).await,
         Cmd::Posture { cmd } => commands::posture::run(&c, &ctx, cmd).await,

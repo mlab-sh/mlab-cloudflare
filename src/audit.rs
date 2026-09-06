@@ -2731,6 +2731,635 @@ pub fn services(p: &Platform) -> Vec<Finding> {
     out
 }
 
+// ---- zero trust ------------------------------------------------------------
+
+/// One Cloudflare Tunnel and what it publishes inward.
+pub struct Tunnel {
+    pub name: String,
+    pub status: String,
+    pub connections: usize,
+    /// The ingress rules, in order. The last is the catch-all.
+    pub ingress: Vec<Value>,
+    /// False when the tunnel is configured from a file on the connector rather
+    /// than from Cloudflare, in which case the API cannot see its ingress at
+    /// all — and "publishes nothing" would be the wrong thing to report.
+    pub ingress_readable: bool,
+}
+
+/// The Zero Trust configuration of one account.
+///
+/// `/cfd_tunnel/{id}/token` is deliberately absent: it returns a live connector
+/// credential, and an audit has no use for the value. Not reading it is a
+/// stronger guarantee than redacting it, because it never enters the cache.
+pub struct ZeroTrust {
+    pub apps: Vec<Value>,
+    pub service_tokens: Vec<Value>,
+    pub idps: Vec<Value>,
+    pub gateway_rules: Vec<Value>,
+    pub gateway_config: Option<Value>,
+    pub gateway_logging: Option<Value>,
+    pub device_policies: Vec<Value>,
+    pub split_exclude: Vec<Value>,
+    pub split_include: Vec<Value>,
+    pub posture_rules: Vec<Value>,
+    pub tunnels: Vec<Tunnel>,
+    pub routes: Vec<Value>,
+    pub targets: Vec<Value>,
+}
+
+/// Who reaches the applications behind Access.
+pub fn access(z: &ZeroTrust) -> Vec<Finding> {
+    let mut public = Vec::new();
+    let mut bypassed = Vec::new();
+    let mut identity_only = Vec::new();
+    let mut weak_idp = Vec::new();
+    let mut forever = Vec::new();
+    let mut no_scim = Vec::new();
+
+    // Providers whose only factor is possession of an inbox.
+    let otp: BTreeSet<String> = z
+        .idps
+        .iter()
+        .filter(|i| str_of(i, "type") == "onetimepin")
+        .map(|i| str_of(i, "id"))
+        .collect();
+
+    for app in &z.apps {
+        let name = str_of(app, "name");
+        let where_ = str_of(app, "domain");
+        let label = if where_.is_empty() {
+            name.clone()
+        } else {
+            format!("{name} ({where_})")
+        };
+
+        for p in list(app, "policies") {
+            let decision = str_of(p, "decision");
+            let includes: Vec<String> = list(p, "include")
+                .iter()
+                .filter_map(|c| c.as_object().and_then(|o| o.keys().next().cloned()))
+                .collect();
+            let requires = list(p, "require").len();
+
+            if decision == "bypass" {
+                // The app still appears in the list, and Access is off for it.
+                bypassed.push(format!("{label}: {:?}", str_of(p, "name")));
+            } else if decision == "allow" && includes.iter().any(|i| i == "everyone") {
+                public.push(format!("{label}: {:?}", str_of(p, "name")));
+            } else if decision == "allow"
+                && requires == 0
+                && includes
+                    .iter()
+                    .all(|i| matches!(i.as_str(), "email" | "email_domain" | "login_method"))
+            {
+                identity_only.push(label.clone());
+            }
+        }
+
+        // An application that will accept an emailed code has one factor, and
+        // it is the inbox.
+        let allowed = list(app, "allowed_idps");
+        if !otp.is_empty()
+            && allowed
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|i| otp.contains(i))
+        {
+            weak_idp.push(label.clone());
+        }
+
+        match str_of(app, "session_duration").as_str() {
+            // `0` means the session never expires.
+            "" => {}
+            "0" => forever.push(format!("{label} (never expires)")),
+            d if long_session(d) => forever.push(format!("{label} ({d})")),
+            _ => {}
+        }
+    }
+
+    for i in &z.idps {
+        if i.get("scim_config")
+            .and_then(|c| c.get("enabled"))
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
+            no_scim.push(format!("{} ({})", str_of(i, "name"), str_of(i, "type")));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "access", text).with(names.join("; ")));
+        }
+    };
+
+    push(
+        Severity::High,
+        format!(
+            "{} Access {} everyone in",
+            public.len(),
+            agree(public.len(), "policy lets", "policies let")
+        ),
+        public.clone(),
+    );
+    push(
+        Severity::High,
+        format!(
+            "{} Access {} the decision to bypass, so Access is off for that path while the \
+             application still reads as protected",
+            bypassed.len(),
+            agree(bypassed.len(), "policy sets", "policies set")
+        ),
+        bypassed.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} on an address alone, with no device, posture or second-factor \
+             requirement",
+            identity_only.len(),
+            agree(
+                identity_only.len(),
+                "application admits",
+                "applications admit"
+            )
+        ),
+        identity_only.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} a one-time-PIN provider, where an email inbox is the only factor",
+            weak_idp.len(),
+            agree(weak_idp.len(), "application accepts", "applications accept")
+        ),
+        weak_idp.clone(),
+    );
+    push(
+        Severity::Low,
+        format!(
+            "{} {} a session of a day or more",
+            forever.len(),
+            agree(forever.len(), "application holds", "applications hold")
+        ),
+        forever.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} identity {} SCIM provisioning, so removing someone from the directory does \
+             not remove their Access",
+            no_scim.len(),
+            agree(no_scim.len(), "provider has no", "providers have no")
+        ),
+        no_scim.clone(),
+    );
+
+    out.extend(service_tokens(&z.service_tokens));
+    out
+}
+
+/// Whether a session duration is a day or longer.
+///
+/// The value is a Go duration string, where the units stop at hours and **`m`
+/// is minutes, not months** — so a week is `168h` and `30m` is half an hour.
+/// Reading `m` as a month would report the shortest session available as the
+/// longest.
+fn long_session(d: &str) -> bool {
+    let split = d.find(|c: char| !c.is_ascii_digit()).unwrap_or(d.len());
+    let (num, unit) = d.split_at(split);
+    matches!(unit, "h") && num.parse::<u64>().unwrap_or(0) >= 24
+}
+
+/// Access service tokens, which bypass interactive authentication entirely.
+fn service_tokens(tokens: &[Value]) -> Vec<Finding> {
+    let mut forever = Vec::new();
+    let mut idle = Vec::new();
+
+    for t in tokens {
+        let name = str_of(t, "name");
+        match days_until(&str_of(t, "expires_at")) {
+            None => forever.push(name.clone()),
+            Some(d) if d > 365 => forever.push(format!("{name} (in {d}d)")),
+            _ => {}
+        }
+        if str_of(t, "last_seen_at").is_empty() {
+            idle.push(name);
+        }
+    }
+
+    let mut out = Vec::new();
+    if !forever.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "access",
+                format!(
+                    "{} service {} interactive authentication and {} no expiry within the \
+                     year",
+                    forever.len(),
+                    agree(forever.len(), "token bypasses", "tokens bypass"),
+                    agree(forever.len(), "has", "have")
+                ),
+            )
+            .with(forever.join(", ")),
+        );
+    }
+    if !idle.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Low,
+                "access",
+                format!(
+                    "{} service {} never been used",
+                    idle.len(),
+                    agree(idle.len(), "token has", "tokens have")
+                ),
+            )
+            .with(idle.join(", ")),
+        );
+    }
+    out
+}
+
+/// Whether the egress control enforces anything, and whether it records it.
+pub fn gateway(z: &ZeroTrust) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    // Deployed and enforcing nothing is the state to name first: the product
+    // reads as present in the dashboard and decides nothing.
+    if z.gateway_config.is_some() && z.gateway_rules.is_empty() {
+        out.push(Finding::new(
+            Severity::High,
+            "gateway",
+            "Gateway is configured and has no policy at all, so it inspects traffic and \
+             decides nothing about it",
+        ));
+    }
+
+    // Order is the whole of it: a broad allow near the top makes everything
+    // below it decorative.
+    let mut above_first_block = Vec::new();
+    for r in &z.gateway_rules {
+        if r.get("enabled").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        match str_of(r, "action").as_str() {
+            "block" | "isolate" | "quarantine" => break,
+            "allow" | "off" if str_of(r, "traffic").trim().is_empty() => {
+                above_first_block.push(str_of(r, "name"))
+            }
+            "allow" | "off" => above_first_block.push(str_of(r, "name")),
+            _ => {}
+        }
+    }
+    if !above_first_block.is_empty() && !z.gateway_rules.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "gateway",
+                format!(
+                    "{} {} above the first block, so everything they match is decided before \
+                     any block is reached",
+                    above_first_block.len(),
+                    agree(
+                        above_first_block.len(),
+                        "allow rule sits",
+                        "allow rules sit"
+                    )
+                ),
+            )
+            .with(above_first_block.join(", ")),
+        );
+    }
+
+    let setting = |path: &[&str]| -> Option<bool> {
+        let mut cur = z.gateway_config.as_ref()?.get("settings")?;
+        for k in path {
+            cur = cur.get(k)?;
+        }
+        cur.as_bool()
+    };
+
+    if setting(&["tls_decrypt", "enabled"]) == Some(false) {
+        out.push(Finding::new(
+            Severity::Medium,
+            "gateway",
+            "TLS inspection is off, so an HTTP policy sees hostnames and nothing else",
+        ));
+    }
+    if setting(&["activity_log", "enabled"]) == Some(false) {
+        out.push(Finding::new(
+            Severity::Medium,
+            "gateway",
+            "the activity log is off, so no decision Gateway makes can be reviewed later",
+        ));
+    }
+
+    // Logging is configured per rule type and per outcome. With blocks alone,
+    // what was allowed leaves no record, and no later investigation is possible.
+    let block_only: Vec<String> = z
+        .gateway_logging
+        .as_ref()
+        .and_then(|l| l.get("settings_by_rule_type"))
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter(|(_, v)| v.get("log_all").and_then(Value::as_bool) != Some(true))
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !block_only.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::Medium,
+                "gateway",
+                format!(
+                    "{} rule {} only what was blocked, so allowed traffic leaves no record",
+                    block_only.len(),
+                    agree(block_only.len(), "type logs", "types log")
+                ),
+            )
+            .with(block_only.join(", ")),
+        );
+    }
+    out
+}
+
+/// What the fleet sends through Gateway, and what it does not.
+pub fn devices(z: &ZeroTrust) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    // In exclude mode everything on the list leaves the device without passing
+    // through Gateway. Private and multicast ranges are the expected defaults;
+    // a routable one is a documented hole in the egress control.
+    let public_excludes: Vec<String> = z
+        .split_exclude
+        .iter()
+        .filter_map(|e| {
+            let addr = str_of(e, "address");
+            let host = str_of(e, "host");
+            if !host.is_empty() {
+                return Some(format!("{host} (domain)"));
+            }
+            (!addr.is_empty() && is_routable(&addr)).then_some(addr)
+        })
+        .collect();
+    if !public_excludes.is_empty() {
+        out.push(
+            Finding::new(
+                Severity::High,
+                "devices",
+                format!(
+                    "{} split-tunnel {} routable traffic around Gateway entirely",
+                    public_excludes.len(),
+                    agree(public_excludes.len(), "exclusion sends", "exclusions send")
+                ),
+            )
+            .with(public_excludes.join(", ")),
+        );
+    }
+
+    for p in &z.device_policies {
+        let name = match str_of(p, "name") {
+            n if n.is_empty() => "the default profile".to_string(),
+            n => n,
+        };
+        if p.get("allow_mode_switch").and_then(Value::as_bool) == Some(true)
+            && p.get("switch_locked").and_then(Value::as_bool) != Some(true)
+        {
+            out.push(Finding::new(
+                Severity::Medium,
+                "devices",
+                format!("{name} lets a user switch WARP off, which turns the fleet's egress control into an opt-in"),
+            ));
+        }
+        if p.get("allow_updates").and_then(Value::as_bool) == Some(false) {
+            out.push(Finding::new(
+                Severity::Low,
+                "devices",
+                format!("{name} does not auto-update the client, so the fleet stays on whatever build it has"),
+            ));
+        }
+    }
+
+    // Posture rules are only controls if a policy consumes them. A populated
+    // list nothing references is the most polished form of theatre here.
+    if !z.posture_rules.is_empty() {
+        let referenced: BTreeSet<String> = z
+            .apps
+            .iter()
+            .flat_map(|a| list(a, "policies").to_vec())
+            .flat_map(|p| [list(&p, "require").to_vec(), list(&p, "include").to_vec()].concat())
+            .filter_map(|c| {
+                c.get("device_posture")
+                    .map(|d| str_of(d, "integration_uid"))
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        let unused: Vec<String> = z
+            .posture_rules
+            .iter()
+            .filter(|r| !referenced.contains(&str_of(r, "id")))
+            .map(|r| str_of(r, "name"))
+            .collect();
+        if !unused.is_empty() {
+            out.push(
+                Finding::new(
+                    Severity::Medium,
+                    "devices",
+                    format!(
+                        "{} posture {} referenced by no Access policy, so {} nothing",
+                        unused.len(),
+                        agree(unused.len(), "rule is", "rules are"),
+                        agree(unused.len(), "it gates", "they gate")
+                    ),
+                )
+                .with(unused.join(", ")),
+            );
+        }
+    }
+    out
+}
+
+/// What the tunnels publish inward, and how wide the routes are.
+pub fn tunnels(z: &ZeroTrust) -> Vec<Finding> {
+    let mut inactive = Vec::new();
+    let mut unverified = Vec::new();
+    let mut open_catch_all = Vec::new();
+    let mut exposed = Vec::new();
+    let mut wide_routes = Vec::new();
+    let mut unreadable = Vec::new();
+
+    for t in &z.tunnels {
+        if !t.ingress_readable {
+            unreadable.push(t.name.clone());
+            continue;
+        }
+        if !matches!(t.status.as_str(), "healthy" | "") || t.connections == 0 {
+            inactive.push(format!("{} ({})", t.name, t.status));
+        }
+        for (i, rule) in t.ingress.iter().enumerate() {
+            let hostname = str_of(rule, "hostname");
+            let service = str_of(rule, "service");
+            let last = i + 1 == t.ingress.len();
+
+            if hostname.is_empty() {
+                // The catch-all. Anything but a refusal means a request for an
+                // unlisted hostname still reaches something inside.
+                if last && !service.starts_with("http_status:4") && !service.is_empty() {
+                    open_catch_all.push(format!("{}: {service}", t.name));
+                }
+                continue;
+            }
+            exposed.push(format!("{hostname} → {service}"));
+            if rule
+                .get("originRequest")
+                .and_then(|o| o.get("noTLSVerify"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                unverified.push(format!("{hostname} → {service}"));
+            }
+        }
+    }
+
+    for r in &z.routes {
+        let net = str_of(r, "network");
+        if prefix_len(&net).is_some_and(|len| len <= 16) {
+            wide_routes.push(format!("{net} ({})", str_of(r, "comment")));
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut push = |sev, text: String, names: Vec<String>| {
+        if !names.is_empty() {
+            out.push(Finding::new(sev, "tunnels", text).with(names.join(", ")));
+        }
+    };
+
+    push(
+        Severity::Medium,
+        format!(
+            "{} tunnel {} no healthy connector, so the paths {} configured are waiting \
+             rather than serving",
+            inactive.len(),
+            agree(inactive.len(), "has", "have"),
+            agree(inactive.len(), "it has", "they have")
+        ),
+        inactive.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} ingress {} the origin's certificate",
+            unverified.len(),
+            agree(
+                unverified.len(),
+                "rule does not verify",
+                "rules do not verify"
+            )
+        ),
+        unverified.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} tunnel {} a catch-all that reaches something rather than refusing, so an \
+             unlisted hostname still lands inside",
+            open_catch_all.len(),
+            agree(open_catch_all.len(), "has", "have")
+        ),
+        open_catch_all.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} private {} advertised to every enrolled device at a /16 or wider",
+            wide_routes.len(),
+            agree(wide_routes.len(), "range is", "ranges are")
+        ),
+        wide_routes.clone(),
+    );
+    push(
+        Severity::Medium,
+        format!(
+            "{} {} configured on the connector rather than in Cloudflare, so what {} \
+             publishes inward cannot be read from the API",
+            unreadable.len(),
+            agree(unreadable.len(), "tunnel is", "tunnels are"),
+            agree(unreadable.len(), "it", "they")
+        ),
+        unreadable.clone(),
+    );
+    push(
+        Severity::Info,
+        format!(
+            "{} internal {} published through a tunnel: this is the list of what the \
+             internet can reach inside",
+            exposed.len(),
+            agree(exposed.len(), "service is", "services are")
+        ),
+        exposed.clone(),
+    );
+    out
+}
+
+/// Whether an address or prefix is globally routable unicast — space a real
+/// internet service could live on.
+///
+/// The default split-tunnel list is almost entirely special-purpose space:
+/// private, loopback, link-local, multicast, and a dozen ranges from the IANA
+/// special-purpose registry. Excluding those from the fleet's tunnel is the
+/// intended configuration, so flagging them turns a correct default into eight
+/// findings. Only an exclusion a service could actually be reached on is worth
+/// naming.
+fn is_routable(cidr: &str) -> bool {
+    let addr = cidr.split('/').next().unwrap_or(cidr);
+    let Ok(ip) = addr.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    !is_private(addr) && !is_special_purpose(ip)
+}
+
+/// The IANA special-purpose ranges a split tunnel is expected to carry, beyond
+/// the private space [`is_private`] already covers.
+fn is_special_purpose(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 0.0.0.0/8 this network; 240.0.0.0/4 reserved.
+                || o[0] == 0
+                || o[0] >= 240
+                // 192.0.0.0/24 IETF assignments; 192.88.99.0/24 deprecated 6to4.
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+                // 198.18.0.0/15 benchmarking.
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_multicast()
+                // 100::/64 discard; 64:ff9b::/96 NAT64.
+                || (seg[0] == 0x0100 && seg[1..4] == [0, 0, 0])
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b)
+                // 2001::/32 Teredo, 2001:db8::/32 documentation, 2002::/16 6to4.
+                || (seg[0] == 0x2001 && (seg[1] == 0 || seg[1] == 0x0db8))
+                || seg[0] == 0x2002
+        }
+    }
+}
+
+/// The prefix length of a CIDR, when it has one.
+fn prefix_len(cidr: &str) -> Option<u8> {
+    cidr.split_once('/')?.1.parse().ok()
+}
+
 // ---- accessors --------------------------------------------------------------
 
 fn str_of(v: &Value, k: &str) -> String {
@@ -4169,6 +4798,276 @@ mod tests {
         let hit = f.iter().find(|f| f.finding.contains("wildcard")).unwrap();
         assert!(hit.detail.contains("wide"));
         assert!(!hit.detail.contains("narrow"));
+    }
+
+    // ---- zero trust ----------------------------------------------------------
+
+    fn zt() -> ZeroTrust {
+        ZeroTrust {
+            apps: vec![],
+            service_tokens: vec![],
+            idps: vec![],
+            gateway_rules: vec![],
+            gateway_config: None,
+            gateway_logging: None,
+            device_policies: vec![],
+            split_exclude: vec![],
+            split_include: vec![],
+            posture_rules: vec![],
+            tunnels: vec![],
+            routes: vec![],
+            targets: vec![],
+        }
+    }
+
+    fn app(name: &str, policies: Value) -> Value {
+        json!({
+            "name": name, "domain": format!("{name}.example.com"),
+            "type": "self_hosted", "session_duration": "1h",
+            "allowed_idps": [], "policies": policies,
+        })
+    }
+
+    #[test]
+    fn a_policy_that_admits_everyone_is_the_application_being_public() {
+        let mut z = zt();
+        z.apps = vec![app(
+            "wiki",
+            json!([{"name": "open", "decision": "allow", "include": [{"everyone": {}}]}]),
+        )];
+        let f = access(&z);
+        assert_eq!(at(&f, "lets everyone in"), Severity::High);
+    }
+
+    #[test]
+    fn a_bypass_decision_turns_access_off_while_the_app_still_reads_as_protected() {
+        let mut z = zt();
+        z.apps = vec![app(
+            "api",
+            json!([{"name": "skip", "decision": "bypass", "include": [{"ip": {"ip": "0.0.0.0/0"}}]}]),
+        )];
+        let f = access(&z);
+        assert_eq!(at(&f, "decision to bypass"), Severity::High);
+    }
+
+    #[test]
+    fn an_address_alone_is_reported_and_a_second_factor_clears_it() {
+        let mut z = zt();
+        z.apps = vec![
+            app(
+                "thin",
+                json!([{"name": "p", "decision": "allow",
+                 "include": [{"email_domain": {"domain": "example.com"}}], "require": []}]),
+            ),
+            app(
+                "thick",
+                json!([{"name": "p", "decision": "allow",
+                 "include": [{"email_domain": {"domain": "example.com"}}],
+                 "require": [{"device_posture": {"integration_uid": "r-1"}}]}]),
+            ),
+        ];
+        let f = access(&z);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("address alone"))
+            .unwrap();
+        assert!(hit.detail.contains("thin"));
+        assert!(
+            !hit.detail.contains("thick"),
+            "a require clause is the difference"
+        );
+    }
+
+    #[test]
+    fn an_application_that_accepts_an_emailed_code_has_one_factor() {
+        let mut z = zt();
+        z.idps = vec![json!({"id": "otp-1", "name": "PIN", "type": "onetimepin",
+                             "scim_config": {"enabled": true}})];
+        let mut a = app("admin", json!([]));
+        a["allowed_idps"] = json!(["otp-1"]);
+        z.apps = vec![a];
+        assert_eq!(at(&access(&z), "one-time-PIN"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_session_is_judged_by_its_unit_not_its_number() {
+        assert!(long_session("24h"));
+        assert!(long_session("168h"), "a week is expressed in hours");
+        assert!(!long_session("8h"));
+        assert!(
+            !long_session("30m"),
+            "m is minutes in a Go duration, and reading it as months would report \
+             the shortest session available as the longest"
+        );
+        assert!(!long_session(""));
+    }
+
+    #[test]
+    fn gateway_configured_with_no_policy_is_the_first_thing_to_say() {
+        let mut z = zt();
+        z.gateway_config = Some(json!({"settings": {"tls_decrypt": {"enabled": true}}}));
+        assert_eq!(at(&gateway(&z), "no policy at all"), Severity::High);
+
+        // An account without Gateway at all gets no finding, not a false one.
+        assert!(!has(&gateway(&zt()), "no policy at all"));
+    }
+
+    #[test]
+    fn inspection_and_logging_are_read_from_the_settings_that_exist() {
+        let mut z = zt();
+        z.gateway_config = Some(json!({"settings": {
+            "tls_decrypt": {"enabled": false}, "activity_log": {"enabled": false}
+        }}));
+        z.gateway_rules = vec![json!({"action": "block", "enabled": true, "name": "malware"})];
+        z.gateway_logging = Some(json!({"settings_by_rule_type": {
+            "dns": {"log_all": true}, "http": {"log_all": false}
+        }}));
+        let f = gateway(&z);
+        assert_eq!(at(&f, "TLS inspection is off"), Severity::Medium);
+        assert_eq!(at(&f, "activity log is off"), Severity::Medium);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("only what was blocked"))
+            .unwrap();
+        assert_eq!(hit.detail, "http");
+    }
+
+    #[test]
+    fn the_default_split_tunnel_list_is_not_a_finding() {
+        // Almost all of it is special-purpose space, and excluding that from
+        // the fleet's tunnel is the intended configuration.
+        let mut z = zt();
+        z.split_exclude = [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+            "192.0.0.0/24",
+            "192.88.99.0/24",
+            "198.18.0.0/15",
+            "100.64.0.0/10",
+            "fe80::/10",
+            "ff01::/16",
+            "100::/64",
+        ]
+        .iter()
+        .map(|a| json!({"address": a}))
+        .collect();
+        assert!(!has(&devices(&z), "around Gateway"));
+    }
+
+    #[test]
+    fn an_exclusion_a_service_could_live_on_is_the_finding() {
+        let mut z = zt();
+        z.split_exclude = vec![
+            json!({"address": "10.0.0.0/8"}),
+            json!({"address": "8.8.8.0/24"}),
+            json!({"host": "updates.example.com"}),
+        ];
+        let f = devices(&z);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("around Gateway"))
+            .unwrap();
+        assert_eq!(hit.severity, Severity::High);
+        assert!(hit.detail.contains("8.8.8.0/24"));
+        assert!(hit.detail.contains("updates.example.com"));
+        assert!(!hit.detail.contains("10.0.0.0/8"));
+    }
+
+    #[test]
+    fn a_posture_rule_no_policy_references_gates_nothing() {
+        let mut z = zt();
+        z.posture_rules = vec![
+            json!({"id": "r-1", "name": "disk encryption"}),
+            json!({"id": "r-2", "name": "firewall"}),
+        ];
+        z.apps = vec![app(
+            "admin",
+            json!([{"name": "p", "decision": "allow", "include": [],
+                    "require": [{"device_posture": {"integration_uid": "r-1"}}]}]),
+        )];
+        let f = devices(&z);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("referenced by no Access policy"))
+            .unwrap();
+        assert_eq!(hit.detail, "firewall");
+    }
+
+    fn tunnel(name: &str, ingress: Value, readable: bool) -> Tunnel {
+        Tunnel {
+            name: name.to_string(),
+            status: "healthy".into(),
+            connections: 2,
+            ingress: ingress.as_array().cloned().unwrap_or_default(),
+            ingress_readable: readable,
+        }
+    }
+
+    #[test]
+    fn the_ingress_rules_are_the_internal_exposure_map() {
+        let mut z = zt();
+        z.tunnels = vec![tunnel(
+            "hq",
+            json!([
+                {"hostname": "git.example.com", "service": "http://10.0.0.5:3000"},
+                {"service": "http_status:404"}
+            ]),
+            true,
+        )];
+        let f = tunnels(&z);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("published through a tunnel"))
+            .unwrap();
+        assert!(hit
+            .detail
+            .contains("git.example.com → http://10.0.0.5:3000"));
+        assert!(
+            !has(&f, "catch-all that reaches"),
+            "a 404 catch-all refuses"
+        );
+    }
+
+    #[test]
+    fn a_catch_all_that_reaches_something_still_lands_inside() {
+        let mut z = zt();
+        z.tunnels = vec![tunnel(
+            "hq",
+            json!([{"service": "http://10.0.0.5:8080"}]),
+            true,
+        )];
+        assert_eq!(at(&tunnels(&z), "catch-all that reaches"), Severity::Medium);
+    }
+
+    #[test]
+    fn a_locally_configured_tunnel_is_unread_rather_than_empty() {
+        // Its ingress lives in a file on the connector, so reporting that it
+        // publishes nothing would be a claim the API cannot support.
+        let mut z = zt();
+        z.tunnels = vec![tunnel("local", json!([]), false)];
+        let f = tunnels(&z);
+        assert_eq!(at(&f, "configured on the connector"), Severity::Medium);
+        assert!(!has(&f, "published through a tunnel"));
+    }
+
+    #[test]
+    fn a_wide_private_route_reaches_the_whole_estate() {
+        let mut z = zt();
+        z.routes = vec![
+            json!({"network": "10.0.0.0/8", "comment": "everything"}),
+            json!({"network": "10.4.2.0/24", "comment": "one subnet"}),
+        ];
+        let f = tunnels(&z);
+        let hit = f
+            .iter()
+            .find(|f| f.finding.contains("/16 or wider"))
+            .unwrap();
+        assert!(hit.detail.contains("10.0.0.0/8"));
+        assert!(!hit.detail.contains("10.4.2.0/24"));
     }
 
     // ---- ordering -----------------------------------------------------------
