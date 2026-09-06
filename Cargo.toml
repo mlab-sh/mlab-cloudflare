@@ -1,6 +1,6 @@
 [package]
 name = "mlab-cloudflare"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "CLI over the Cloudflare API, built as a base for read-only account and zone audit"
 license = "MIT"
